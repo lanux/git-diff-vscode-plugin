@@ -3,20 +3,22 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { extractThreeVersions, gitAdd } from '../git/show';
 import { getRepoRoot } from '../git/exec';
+import { listConflictedFiles } from '../git/conflicts';
 import { buildThreeWayHunks, hasConflictMarkers } from '../diff/threeWay';
 import { detectLanguage } from './language';
 import { renderShell } from './htmlShell';
-import type { ExtToWebview, WebviewToExt } from '../types';
+import type { WebviewToExt, InitMergeMessage } from '../types';
 
 export class MergePanel {
-  private constructor(
-    private readonly panel: vscode.WebviewPanel,
-    private readonly fileUri: vscode.Uri,
-    private readonly repoRoot: string,
-    private readonly relPath: string
-  ) {
+  private files: string[] = [];   // repo-relative
+  private fileIndex = 0;
+  private repoRoot = '';
+
+  private constructor(private readonly panel: vscode.WebviewPanel) {
     panel.webview.onDidReceiveMessage((msg: WebviewToExt) => this.handle(msg));
   }
+
+  private get currentRel(): string { return this.files[this.fileIndex] ?? ''; }
 
   static async open(context: vscode.ExtensionContext, fileUri: vscode.Uri) {
     const repoRoot = await getRepoRoot(fileUri.fsPath);
@@ -25,7 +27,11 @@ export class MergePanel {
       vscode.window.showErrorMessage(`Git Diff Fast: ${versions.relPath} is not in a merge conflict.`);
       return undefined;
     }
-    const { hunks } = buildThreeWayHunks(versions.local, versions.base, versions.remote);
+
+    const allConflicts = await listConflictedFiles(repoRoot).catch(() => [] as string[]);
+    const files = allConflicts.length ? allConflicts : [versions.relPath];
+    const idx = files.indexOf(versions.relPath);
+    const fileIndex = idx >= 0 ? idx : 0;
 
     const panel = vscode.window.createWebviewPanel(
       'gitDiff',
@@ -39,38 +45,84 @@ export class MergePanel {
     );
     panel.webview.html = renderShell(panel.webview, context.extensionUri);
 
-    const mp = new MergePanel(panel, fileUri, versions.repoRoot, versions.relPath);
+    const mp = new MergePanel(panel);
+    mp.repoRoot = repoRoot;
+    mp.files = files;
+    mp.fileIndex = fileIndex;
 
     await waitForReady(panel);
+    await mp.postInit(versions.local, versions.base, versions.remote);
+    return mp;
+  }
 
-    const init: ExtToWebview = {
+  private async postInit(local: string, base: string, remote: string) {
+    const { hunks } = buildThreeWayHunks(local, base, remote);
+    const fsPath = path.join(this.repoRoot, this.currentRel);
+    this.panel.title = `Merge: ${path.basename(fsPath)}`;
+    const init: InitMergeMessage = {
       type: 'init',
       view: 'merge',
-      filePath: fileUri.fsPath,
-      language: detectLanguage(fileUri.fsPath),
-      local: versions.local,
-      base: versions.base,
-      remote: versions.remote,
-      hunks
+      filePath: fsPath,
+      language: detectLanguage(fsPath),
+      local, base, remote, hunks,
+      files: this.files,
+      fileIndex: this.fileIndex
     };
-    panel.webview.postMessage(init);
-    return mp;
+    this.panel.webview.postMessage(init);
+  }
+
+  private async loadFileAt(index: number) {
+    if (index < 0 || index >= this.files.length) return;
+    const fsPath = path.join(this.repoRoot, this.files[index]);
+    try {
+      const versions = await extractThreeVersions(fsPath, this.repoRoot);
+      this.fileIndex = index;
+      await this.postInit(versions.local, versions.base, versions.remote);
+    } catch (e: unknown) {
+      vscode.window.showErrorMessage(`Failed to load ${this.files[index]}: ${(e as Error).message ?? e}`);
+    }
+  }
+
+  private async saveCurrent(content: string): Promise<boolean> {
+    if (hasConflictMarkers(content)) {
+      vscode.window.showErrorMessage('Result still contains conflict markers.');
+      return false;
+    }
+    const fsPath = path.join(this.repoRoot, this.currentRel);
+    await fs.promises.writeFile(fsPath, content, 'utf8');
+    await gitAdd(this.repoRoot, this.currentRel);
+    return true;
   }
 
   private async handle(msg: WebviewToExt) {
     if (msg.type === 'saveMerge') {
-      if (hasConflictMarkers(msg.content)) {
-        vscode.window.showErrorMessage('Result still contains conflict markers.');
-        return;
-      }
       try {
-        await fs.promises.writeFile(this.fileUri.fsPath, msg.content, 'utf8');
-        await gitAdd(this.repoRoot, this.relPath);
-        vscode.window.showInformationMessage(`Merged and staged: ${this.relPath}`);
-        this.panel.dispose();
+        const savedRel = this.currentRel;
+        if (!(await this.saveCurrent(msg.content))) return;
+        vscode.window.showInformationMessage(`Merged and staged: ${savedRel}`);
+        // Refresh the conflict list and advance to the next remaining file.
+        // Prefer the file that was at fileIndex+1 before the save (i.e. the natural "next").
+        const remaining = await listConflictedFiles(this.repoRoot).catch(() => [] as string[]);
+        if (!remaining.length) { this.panel.dispose(); return; }
+        const prevNext = this.files[this.fileIndex + 1];
+        const nextIdx = prevNext ? Math.max(0, remaining.indexOf(prevNext)) : 0;
+        this.files = remaining;
+        await this.loadFileAt(nextIdx);
       } catch (e: unknown) {
         vscode.window.showErrorMessage(`Save failed: ${(e as Error).message ?? e}`);
       }
+    } else if (msg.type === 'switchMergeFile') {
+      const target = this.fileIndex + msg.direction;
+      if (target < 0 || target >= this.files.length) return;
+      if (msg.dirty) {
+        const choice = await vscode.window.showWarningMessage(
+          `Discard unsaved edits to ${this.currentRel}?`,
+          { modal: true },
+          'Discard'
+        );
+        if (choice !== 'Discard') return;
+      }
+      await this.loadFileAt(target);
     } else if (msg.type === 'cancel') {
       this.panel.dispose();
     } else if (msg.type === 'cancelCheck') {
@@ -83,7 +135,6 @@ export class MergePanel {
       } else if (choice === 'Abandon Changes') {
         this.panel.dispose();
       }
-      // 'Cancel' or undefined = do nothing, stay open
     }
   }
 }

@@ -92,24 +92,3 @@ export function hasConflictMarkers(text: string): boolean {
   return /^(<{7}|={7}|>{7})/m.test(text);
 }
 
-export function applyHunkSide(hunk: Hunk, side: 'local' | 'remote' | 'both'): Hunk {
-  let resolved: string[];
-  let status: Hunk['status'];
-  if (side === 'local') {
-    resolved = hunk.localLines.slice();
-    status = 'accepted-local';
-  } else if (side === 'remote') {
-    resolved = hunk.remoteLines.slice();
-    status = 'accepted-remote';
-  } else {
-    if (hunk.kind === 'auto') {
-      // For auto hunks, "both" restores the auto-merged result
-      resolved = hunk.resolvedLines.slice();
-      status = 'manual';
-    } else {
-      resolved = [...hunk.localLines, ...hunk.remoteLines];
-      status = 'accepted-both';
-    }
-  }
-  return { ...hunk, resolvedLines: resolved, status };
-}

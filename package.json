@@ -2,7 +2,7 @@
   "name": "git-diff-fast",
   "displayName": "Git Diff Fast",
   "description": "Fast three-way merge conflict resolver and branch compare tool for VS Code",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "lanux",
   "license": "Apache-2.0",
   "icon": "icon.png",

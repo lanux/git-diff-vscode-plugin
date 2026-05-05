@@ -34,6 +34,8 @@ export interface InitMergeMessage {
   base: string;
   remote: string;
   hunks: Hunk[];
+  files: string[];   // all conflicted files (repo-relative), for cross-file navigation
+  fileIndex: number; // index of current file within files
 }
 
 export interface InitCompareMessage {
@@ -65,6 +67,7 @@ export type ExtToWebview =
 
 export interface ReadyMessage { type: 'ready'; }
 export interface SaveMergeMessage { type: 'saveMerge'; content: string; }
+export interface SwitchMergeFileMessage { type: 'switchMergeFile'; direction: 1 | -1; dirty: boolean; }
 export interface SaveFileEditMessage { type: 'saveFileEdit'; path: string; content: string; }
 export interface RequestFileDiffMessage { type: 'requestFileDiff'; path: string; ignoreWS?: 'none' | 'trim' | 'inner' | 'whole'; }
 export interface CancelMessage { type: 'cancel'; }
@@ -82,4 +85,5 @@ export type WebviewToExt =
   | CancelMessage
   | CancelCheckMessage
   | RefreshCompareMessage
-  | ReverseCompareMessage;
+  | ReverseCompareMessage
+  | SwitchMergeFileMessage;

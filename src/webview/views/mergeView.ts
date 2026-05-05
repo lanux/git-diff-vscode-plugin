@@ -17,6 +17,8 @@ interface MergeState {
   local: PaneCtx; result: PaneCtx; remote: PaneCtx;
   ranges: Map<number, { local: LineRange; result: LineRange; remote: LineRange }>;
   filePath: string;
+  files: string[];
+  fileIndex: number;
 }
 
 let merge: MergeState | null = null;
@@ -28,7 +30,7 @@ let programmaticEdit = false;
 let decorateRaf = 0;
 let updateRibbonsFn: (() => void) | null = null;
 let mergeGranularity: Granularity = 'char';
-// Store original auto-merged result for each auto hunk so "Apply Both" can restore it
+// Snapshot of each auto hunk's resolvedLines at init, so "Apply All Non-Conflicting" can restore it.
 let autoResolved: Map<number, string[]> = new Map();
 
 function makeEditor(container: HTMLElement, value: string, language: string, readOnly: boolean) {
@@ -110,13 +112,20 @@ function decorateMerge() {
 function updateMergeCounter() {
   if (!merge) return;
   const pending = merge.hunks.filter((h) => h.kind === 'conflict' && h.status === 'pending').length;
-  const total = merge.hunks.filter((h) => h.kind === 'conflict').length;
-  setText('counter', `${total - pending}/${total} resolved \u00B7 ${pending} conflict${pending === 1 ? '' : 's'}`);
+  const changes = merge.hunks.filter((h) => h.kind === 'conflict' || h.kind === 'auto').length;
+  setText(
+    'counter',
+    `${changes} change${changes === 1 ? '' : 's'}. ${pending} conflict${pending === 1 ? '' : 's'}.`
+  );
   const acceptBtn = document.getElementById('accept') as HTMLButtonElement;
   if (acceptBtn) {
     acceptBtn.disabled = pending > 0;
     acceptBtn.title = pending > 0 ? `${pending} unresolved conflict${pending === 1 ? '' : 's'} remaining` : 'Accept merge and stage file';
   }
+  const prevFileBtn = document.getElementById('prevFile') as HTMLButtonElement | null;
+  const nextFileBtn = document.getElementById('nextFile') as HTMLButtonElement | null;
+  if (prevFileBtn) prevFileBtn.disabled = merge.fileIndex <= 0;
+  if (nextFileBtn) nextFileBtn.disabled = merge.fileIndex >= merge.files.length - 1;
 }
 
 function findHunkAtLine(side: 'local' | 'remote', line: number): Hunk | undefined {
@@ -143,30 +152,43 @@ export function getResultContent(): string {
   return merge?.result.editor.getValue() ?? '';
 }
 
-function applyMergeHunk(hunk: Hunk, side: 'local' | 'remote' | 'both') {
+function applyMergeHunk(hunk: Hunk, side: 'local' | 'remote') {
   if (!merge) return;
-  if (side === 'both') {
-    if (hunk.kind === 'auto') {
-      // Restore the original auto-merged result
-      const orig = autoResolved.get(hunk.id);
-      if (orig) hunk.resolvedLines = orig.slice();
-      hunk.status = 'manual';
-      rebuildMerge();
-      return;
-    }
-    hunk.resolvedLines = [...hunk.localLines, ...hunk.remoteLines];
-  } else {
-    hunk.resolvedLines = (side === 'local' ? hunk.localLines : hunk.remoteLines).slice();
-  }
-  hunk.status = side === 'local' ? 'accepted-local' : side === 'remote' ? 'accepted-remote' : 'accepted-both';
+  hunk.resolvedLines = (side === 'local' ? hunk.localLines : hunk.remoteLines).slice();
+  hunk.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
   rebuildMerge();
 }
 
+function linesEqual(a: string[], b: string[]) {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+// IDEA semantics:
+//   Apply All Non-Conflicting → restore auto-merge for every auto hunk.
+//   Apply Left Non-Conflicting → for auto hunks where local changed vs base, use localLines;
+//     hunks that are remote-only changes are left as auto-merged.
+//   Apply Right Non-Conflicting → mirror of left.
 function applyNonConflicting(side: 'local' | 'remote' | 'both') {
   if (!merge) return;
+  let changed = false;
   for (const h of merge.hunks) {
-    if (h.kind === 'auto') applyMergeHunk(h, side);
+    if (h.kind !== 'auto') continue;
+    if (side === 'both') {
+      const orig = autoResolved.get(h.id);
+      if (orig) h.resolvedLines = orig.slice();
+      h.status = 'manual';
+      changed = true;
+    } else {
+      const sideChanged = side === 'local'
+        ? !linesEqual(h.localLines, h.baseLines)
+        : !linesEqual(h.remoteLines, h.baseLines);
+      if (!sideChanged) continue;
+      h.resolvedLines = (side === 'local' ? h.localLines : h.remoteLines).slice();
+      h.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
+      changed = true;
+    }
   }
+  if (changed) rebuildMerge();
 }
 
 const IMPORT_LINE = /^\s*(?:import\b|from\s+\S+\s+import\b|#include\b|using\s+\w+\b|require\s*\()/;
@@ -220,20 +242,40 @@ function rebuildMerge() {
   updateRibbonsFn?.();
 }
 
+function formatTitle(msg: { filePath: string; files: string[]; fileIndex: number }): string {
+  if (msg.files.length > 1) {
+    return `${msg.filePath}  (${msg.fileIndex + 1}/${msg.files.length})`;
+  }
+  return msg.filePath;
+}
+
+function requestSwitchFile(direction: 1 | -1) {
+  if (!merge) return;
+  const target = merge.fileIndex + direction;
+  if (target < 0 || target >= merge.files.length) return;
+  vscode.postMessage({ type: 'switchMergeFile', direction, dirty });
+}
+
 function navigateMerge(dir: 1 | -1) {
   if (!merge) return;
   const conflicts = merge.hunks.filter((h) => h.kind === 'conflict');
-  if (!conflicts.length) return;
   const cur = merge.result.editor.getPosition()?.lineNumber ?? 1;
   const ordered = dir === 1 ? conflicts : conflicts.slice().reverse();
-  const next = ordered.find((h) => {
-    const r = merge!.ranges.get(h.id)!.result;
-    return dir === 1 ? r.start > cur : r.start < cur;
-  }) ?? ordered[0];
-  const r = merge.ranges.get(next.id)!.result;
-  merge.result.editor.revealLineInCenter(r.start);
-  merge.result.editor.setPosition({ lineNumber: r.start, column: 1 });
-  merge.result.editor.focus();
+  const next = conflicts.length
+    ? ordered.find((h) => {
+        const r = merge!.ranges.get(h.id)!.result;
+        return dir === 1 ? r.start > cur : r.start < cur;
+      })
+    : undefined;
+  if (next) {
+    const r = merge.ranges.get(next.id)!.result;
+    merge.result.editor.revealLineInCenter(r.start);
+    merge.result.editor.setPosition({ lineNumber: r.start, column: 1 });
+    merge.result.editor.focus();
+    return;
+  }
+  // No more conflicts in this direction → cross to next/prev conflicted file.
+  requestSwitchFile(dir);
 }
 
 function syncScroll(source: monaco.editor.IStandaloneCodeEditor, others: monaco.editor.IStandaloneCodeEditor[]) {
@@ -245,8 +287,29 @@ function syncScroll(source: monaco.editor.IStandaloneCodeEditor, others: monaco.
   });
 }
 
+function captureAutoResolved(hunks: Hunk[]) {
+  autoResolved = new Map();
+  for (const h of hunks) {
+    if (h.kind === 'auto') autoResolved.set(h.id, h.resolvedLines.slice());
+  }
+}
+
 export function initMerge(msg: InitMergeMessage) {
   setMode('merge');
+
+  // Re-init for a different file: reuse existing editors, just swap state.
+  if (merge) {
+    merge.hunks = msg.hunks;
+    merge.filePath = msg.filePath;
+    merge.files = msg.files;
+    merge.fileIndex = msg.fileIndex;
+    captureAutoResolved(msg.hunks);
+    dirty = false;
+    setText('title', formatTitle(msg));
+    rebuildMerge();
+    return;
+  }
+
   const built = buildAlignedThree(msg.hunks);
   const local = makeEditor(byId('local'), built.local, msg.language, true);
   const result = makeEditor(byId('result'), built.result, msg.language, false);
@@ -256,13 +319,12 @@ export function initMerge(msg: InitMergeMessage) {
     local: { editor: local, decorations: [] },
     result: { editor: result, decorations: [] },
     remote: { editor: remote, decorations: [] },
-    ranges: built.ranges
+    ranges: built.ranges,
+    files: msg.files,
+    fileIndex: msg.fileIndex
   };
-  autoResolved = new Map();
-  for (const h of msg.hunks) {
-    if (h.kind === 'auto') autoResolved.set(h.id, h.resolvedLines.slice());
-  }
-  setText('title', msg.filePath);
+  captureAutoResolved(msg.hunks);
+  setText('title', formatTitle(msg));
   syncScroll(local, [result, remote]);
   syncScroll(result, [local, remote]);
   syncScroll(remote, [local, result]);
@@ -338,6 +400,10 @@ export function initMerge(msg: InitMergeMessage) {
 
   byId('prev').onclick = () => navigateMerge(-1);
   byId('next').onclick = () => navigateMerge(1);
+  const prevFileBtn = document.getElementById('prevFile') as HTMLButtonElement | null;
+  const nextFileBtn = document.getElementById('nextFile') as HTMLButtonElement | null;
+  if (prevFileBtn) prevFileBtn.onclick = () => requestSwitchFile(-1);
+  if (nextFileBtn) nextFileBtn.onclick = () => requestSwitchFile(1);
   byId('applyL').onclick = () => applyNonConflicting('local');
   byId('applyR').onclick = () => applyNonConflicting('remote');
   byId('applyB').onclick = () => applyNonConflicting('both');

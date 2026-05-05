@@ -34,8 +34,10 @@ export function renderShell(
   <div id="mergeRoot">
     <div class="toolbar">
       <div class="actions-group">
-        <button id="prev" class="action-btn" title="Previous conflict (F7)" aria-label="Previous conflict"><span class="codicon codicon-arrow-up"></span></button>
-        <button id="next" class="action-btn" title="Next conflict (Shift+F7)" aria-label="Next conflict"><span class="codicon codicon-arrow-down"></span></button>
+        <button id="prev" class="action-btn" title="Previous conflict (F7) — crosses file boundary" aria-label="Previous conflict"><span class="codicon codicon-arrow-up"></span></button>
+        <button id="next" class="action-btn" title="Next conflict (Shift+F7) — crosses file boundary" aria-label="Next conflict"><span class="codicon codicon-arrow-down"></span></button>
+        <button id="prevFile" class="action-btn" title="Previous conflicted file" aria-label="Previous file"><span class="codicon codicon-chevron-left"></span></button>
+        <button id="nextFile" class="action-btn" title="Next conflicted file" aria-label="Next file"><span class="codicon codicon-chevron-right"></span></button>
         <span id="counter" class="action-label">0 conflicts</span>
       </div>
       <div class="actions-separator"></div>

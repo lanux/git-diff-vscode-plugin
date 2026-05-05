@@ -11,3 +11,11 @@ declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
 
 export const vscode = acquireVsCodeApi();
 export { monaco };
+
+export function getVsCodeTheme(): string {
+  const cls = document.body.className;
+  if (cls.includes('vscode-high-contrast-light')) return 'hc-light';
+  if (cls.includes('vscode-high-contrast')) return 'hc-black';
+  if (cls.includes('vscode-dark')) return 'vs-dark';
+  return 'vs';
+}

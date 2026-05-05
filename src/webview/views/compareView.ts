@@ -6,7 +6,7 @@ import { wordDiff, wordTokenDiff, type Granularity } from '../diff/wordDiff';
 import { byId, setText, escapeHtml, setMode } from '../components/toolbar';
 import { renderTree } from '../components/changesTree';
 import { Ribbon } from '../components/ribbon';
-import { vscode } from '../api';
+import { vscode, getVsCodeTheme } from '../api';
 
 interface PaneCtx {
   editor: monaco.editor.IStandaloneCodeEditor;
@@ -43,7 +43,7 @@ function makeEditor(container: HTMLElement, value: string, language: string, rea
     lineNumbers: 'on',
     renderLineHighlight: 'all',
     scrollBeyondLastLine: false,
-    theme: 'vs-dark'
+    theme: getVsCodeTheme()
   });
 }
 

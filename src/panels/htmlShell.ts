@@ -41,7 +41,7 @@ export function renderShell(
       <div class="actions-separator"></div>
       <div class="actions-group">
         <button id="applyL" class="action-btn" title="Apply all non-conflicting from Local (Alt+Shift+,)" aria-label="Apply from Local"><span class="codicon codicon-arrow-right"></span></button>
-        <button id="applyB" class="action-btn" title="Apply all non-conflicting from both sides" aria-label="Apply from Both"><span class="codicon codicon-arrow-swap"></span></button>
+        <button id="applyB" class="action-btn" title="Restore all non-conflicting to auto-merged result" aria-label="Restore auto-merged"><span class="codicon codicon-arrow-swap"></span></button>
         <button id="applyR" class="action-btn" title="Apply all non-conflicting from Remote (Alt+Shift+.)" aria-label="Apply from Remote"><span class="codicon codicon-arrow-left"></span></button>
         <button id="magic" class="action-btn" title="Magic Resolve: auto-resolve whitespace-only and pure import conflicts" aria-label="Magic Resolve"><span class="codicon codicon-wand"></span></button>
       </div>

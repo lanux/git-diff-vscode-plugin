@@ -28,6 +28,8 @@ let programmaticEdit = false;
 let decorateRaf = 0;
 let updateRibbonsFn: (() => void) | null = null;
 let mergeGranularity: Granularity = 'char';
+// Store original auto-merged result for each auto hunk so "Apply Both" can restore it
+let autoResolved: Map<number, string[]> = new Map();
 
 function makeEditor(container: HTMLElement, value: string, language: string, readOnly: boolean) {
   return monaco.editor.create(container, {
@@ -143,8 +145,19 @@ export function getResultContent(): string {
 
 function applyMergeHunk(hunk: Hunk, side: 'local' | 'remote' | 'both') {
   if (!merge) return;
-  if (side === 'both') hunk.resolvedLines = [...hunk.localLines, ...hunk.remoteLines];
-  else hunk.resolvedLines = (side === 'local' ? hunk.localLines : hunk.remoteLines).slice();
+  if (side === 'both') {
+    if (hunk.kind === 'auto') {
+      // Restore the original auto-merged result
+      const orig = autoResolved.get(hunk.id);
+      if (orig) hunk.resolvedLines = orig.slice();
+      hunk.status = 'manual';
+      rebuildMerge();
+      return;
+    }
+    hunk.resolvedLines = [...hunk.localLines, ...hunk.remoteLines];
+  } else {
+    hunk.resolvedLines = (side === 'local' ? hunk.localLines : hunk.remoteLines).slice();
+  }
   hunk.status = side === 'local' ? 'accepted-local' : side === 'remote' ? 'accepted-remote' : 'accepted-both';
   rebuildMerge();
 }
@@ -152,7 +165,7 @@ function applyMergeHunk(hunk: Hunk, side: 'local' | 'remote' | 'both') {
 function applyNonConflicting(side: 'local' | 'remote' | 'both') {
   if (!merge) return;
   for (const h of merge.hunks) {
-    if (h.kind === 'conflict' && h.status === 'pending') applyMergeHunk(h, side);
+    if (h.kind === 'auto') applyMergeHunk(h, side);
   }
 }
 
@@ -245,6 +258,10 @@ export function initMerge(msg: InitMergeMessage) {
     remote: { editor: remote, decorations: [] },
     ranges: built.ranges
   };
+  autoResolved = new Map();
+  for (const h of msg.hunks) {
+    if (h.kind === 'auto') autoResolved.set(h.id, h.resolvedLines.slice());
+  }
   setText('title', msg.filePath);
   syncScroll(local, [result, remote]);
   syncScroll(result, [local, remote]);

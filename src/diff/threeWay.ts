@@ -15,7 +15,7 @@ export function splitLines(s: string): string[] {
 
 interface Diff3Region {
   ok?: string[];
-  conflict?: { a: string[]; o: string[]; b: string[] };
+  conflict?: { a: string[]; o: string[]; b: string[]; aIndex: number; oIndex: number; bIndex: number };
 }
 
 export function buildThreeWayHunks(local: string, base: string, remote: string): BuildResult {
@@ -25,21 +25,37 @@ export function buildThreeWayHunks(local: string, base: string, remote: string):
   const regions = diff3Merge(localLines, baseLines, remoteLines) as unknown as Diff3Region[];
 
   const hunks: Hunk[] = [];
-  const resultLines: string[] = [];
+  const allResultLines: string[] = [];
   let id = 0;
+  // Track positions in the original arrays
+  let li = 0, bi = 0, ri = 0;
+  // Track where the current auto hunk's result lines start in allResultLines
+  let resultStart = 0;
+
   for (const r of regions) {
     if (r.ok) {
-      hunks.push({
-        id: id++, kind: 'auto',
-        localLines: r.ok.slice(),
-        baseLines: r.ok.slice(),
-        remoteLines: r.ok.slice(),
-        resolvedLines: r.ok.slice(),
-        status: 'manual'
-      });
-      resultLines.push(...r.ok);
+      allResultLines.push(...r.ok);
     } else if (r.conflict) {
       const c = r.conflict;
+      // Extract original lines for the auto hunk preceding this conflict.
+      // The conflict's *Index fields tell us where the conflict starts in each original array,
+      // so the lines between our current position and the conflict start form the auto hunk.
+      const localSlice = localLines.slice(li, c.aIndex);
+      const baseSlice = baseLines.slice(bi, c.oIndex);
+      const remoteSlice = remoteLines.slice(ri, c.bIndex);
+
+      if (localSlice.length > 0 || baseSlice.length > 0 || remoteSlice.length > 0) {
+        hunks.push({
+          id: id++, kind: 'auto',
+          localLines: localSlice,
+          baseLines: baseSlice,
+          remoteLines: remoteSlice,
+          resolvedLines: allResultLines.slice(resultStart),
+          status: 'manual'
+        });
+      }
+
+      // Conflict hunk
       hunks.push({
         id: id++, kind: 'conflict',
         localLines: c.a.slice(),
@@ -48,9 +64,28 @@ export function buildThreeWayHunks(local: string, base: string, remote: string):
         resolvedLines: [],
         status: 'pending'
       });
+
+      // Advance positions past this conflict
+      li = c.aIndex + c.a.length;
+      bi = c.oIndex + c.o.length;
+      ri = c.bIndex + c.b.length;
+      resultStart = allResultLines.length;
     }
   }
-  return { hunks, initialResult: resultLines.join('\n') };
+
+  // Remaining lines after the last conflict (or entire file if no conflicts)
+  if (li < localLines.length || bi < baseLines.length || ri < remoteLines.length) {
+    hunks.push({
+      id: id++, kind: 'auto',
+      localLines: localLines.slice(li),
+      baseLines: baseLines.slice(bi),
+      remoteLines: remoteLines.slice(ri),
+      resolvedLines: allResultLines.slice(resultStart),
+      status: 'manual'
+    });
+  }
+
+  return { hunks, initialResult: allResultLines.join('\n') };
 }
 
 export function hasConflictMarkers(text: string): boolean {
@@ -67,8 +102,14 @@ export function applyHunkSide(hunk: Hunk, side: 'local' | 'remote' | 'both'): Hu
     resolved = hunk.remoteLines.slice();
     status = 'accepted-remote';
   } else {
-    resolved = [...hunk.localLines, ...hunk.remoteLines];
-    status = 'accepted-both';
+    if (hunk.kind === 'auto') {
+      // For auto hunks, "both" restores the auto-merged result
+      resolved = hunk.resolvedLines.slice();
+      status = 'manual';
+    } else {
+      resolved = [...hunk.localLines, ...hunk.remoteLines];
+      status = 'accepted-both';
+    }
   }
   return { ...hunk, resolvedLines: resolved, status };
 }

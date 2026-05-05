@@ -1,0 +1,91 @@
+{
+  "name": "git-diff-fast",
+  "displayName": "Git Diff Fast",
+  "description": "Fast three-way merge conflict resolver and branch compare tool for VS Code",
+  "version": "0.0.1",
+  "publisher": "lanux",
+  "license": "Apache-2.0",
+  "icon": "icon.png",
+  "homepage": "https://github.com/lanux/git-diff-vscode-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/lanux/git-diff-vscode-plugin/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lanux/git-diff-vscode-plugin"
+  },
+  "keywords": [
+    "git",
+    "merge",
+    "diff",
+    "conflict",
+    "three-way-merge",
+    "branch-compare",
+    "visual-diff"
+  ],
+  "pricing": "Free",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "main": "./out/extension.js",
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitDiff.openMergeTool",
+        "title": "Resolve Conflicts",
+        "category": "Git Diff Fast"
+      },
+      {
+        "command": "gitCompare.compare",
+        "title": "Compare",
+        "category": "Git Compare"
+      }
+    ],
+    "menus": {
+      "scm/resourceState/context": [
+        {
+          "command": "gitDiff.openMergeTool",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "1_modification"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "gitCompare.compare",
+          "group": "3_compare@1"
+        },
+        {
+          "command": "gitDiff.openMergeTool",
+          "when": "!explorerResourceIsFolder",
+          "group": "3_compare@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "test": "node esbuild.js && mocha out/test/**/*.test.js",
+    "build": "node esbuild.js --production && vsce package --no-dependencies",
+    "vscode:prepublish": "node esbuild.js --production"
+  },
+  "dependencies": {
+    "@vscode/codicons": "^0.0.45",
+    "monaco-editor": "^0.55.1",
+    "node-diff3": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^25.6.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.28.0",
+    "mocha": "^11.7.5",
+    "typescript": "^6.0.3"
+  }
+}

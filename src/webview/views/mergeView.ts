@@ -72,9 +72,33 @@ function decorateMerge() {
       });
     } else if (h.kind === 'conflict') {
       const cls = h.status === 'pending' ? 'hunk-conflict-pending' : 'hunk-resolved';
-      ld.push(decorationFor(r.local, cls, 'action-glyph right'));
+      // IDEA-aligned glyphs:
+      //   pending          → both sides show »/« (apply, replaces result)
+      //   accepted-local   → local=× (revert), remote=⤓ (append remote after local)
+      //   accepted-remote  → local=⤓ (prepend local before remote), remote=× (revert)
+      //   accepted-both    → both sides show × (revert)
+      let leftGlyph: string;
+      let rightGlyph: string;
+      switch (h.status) {
+        case 'accepted-local':
+          leftGlyph = 'action-glyph revert';
+          rightGlyph = 'action-glyph append-left';
+          break;
+        case 'accepted-remote':
+          leftGlyph = 'action-glyph append-right';
+          rightGlyph = 'action-glyph revert';
+          break;
+        case 'accepted-both':
+          leftGlyph = 'action-glyph revert';
+          rightGlyph = 'action-glyph revert';
+          break;
+        default:
+          leftGlyph = 'action-glyph right';
+          rightGlyph = 'action-glyph left';
+      }
+      ld.push(decorationFor(r.local, cls, leftGlyph));
       rd.push(decorationFor(r.result, cls));
-      remd.push(decorationFor(r.remote, cls, 'action-glyph left'));
+      remd.push(decorationFor(r.remote, cls, rightGlyph));
       // Scrollbar stripe for conflict hunks
       const stripeColor = h.status === 'pending' ? 'rgba(232,118,0,.8)' : 'rgba(98,150,85,.5)';
       rd.push({
@@ -152,10 +176,35 @@ export function getResultContent(): string {
   return merge?.result.editor.getValue() ?? '';
 }
 
-function applyMergeHunk(hunk: Hunk, side: 'local' | 'remote') {
-  if (!merge) return;
-  hunk.resolvedLines = (side === 'local' ? hunk.localLines : hunk.remoteLines).slice();
-  hunk.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
+// Click on a side's glyph for a conflict hunk. IDEA semantics:
+//   - own side already accepted → revert (back to pending, drop resolved)
+//   - other side accepted        → append this side (local goes before remote in result)
+//   - pending                    → replace result with this side
+function handleConflictClick(hunk: Hunk, side: 'local' | 'remote') {
+  if (!merge || hunk.kind !== 'conflict') return;
+  const ownAccepted =
+    (side === 'local' && (hunk.status === 'accepted-local' || hunk.status === 'accepted-both')) ||
+    (side === 'remote' && (hunk.status === 'accepted-remote' || hunk.status === 'accepted-both'));
+  if (ownAccepted) {
+    hunk.resolvedLines = [];
+    hunk.status = 'pending';
+    rebuildMerge();
+    return;
+  }
+  const lines = side === 'local' ? hunk.localLines : hunk.remoteLines;
+  const otherAccepted =
+    (side === 'local' && hunk.status === 'accepted-remote') ||
+    (side === 'remote' && hunk.status === 'accepted-local');
+  if (otherAccepted) {
+    // Append, keeping local-before-remote order in the result.
+    hunk.resolvedLines = side === 'local'
+      ? [...lines, ...hunk.resolvedLines]
+      : [...hunk.resolvedLines, ...lines];
+    hunk.status = 'accepted-both';
+  } else {
+    hunk.resolvedLines = lines.slice();
+    hunk.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
+  }
   rebuildMerge();
 }
 
@@ -287,6 +336,11 @@ function syncScroll(source: monaco.editor.IStandaloneCodeEditor, others: monaco.
   });
 }
 
+function syncIgnoreWSSelect(value: string) {
+  const sel = document.getElementById('mergeIgnoreWS') as HTMLSelectElement | null;
+  if (sel) sel.value = value;
+}
+
 function captureAutoResolved(hunks: Hunk[]) {
   autoResolved = new Map();
   for (const h of hunks) {
@@ -306,6 +360,7 @@ export function initMerge(msg: InitMergeMessage) {
     captureAutoResolved(msg.hunks);
     dirty = false;
     setText('title', formatTitle(msg));
+    syncIgnoreWSSelect(msg.ignoreWS);
     rebuildMerge();
     return;
   }
@@ -332,12 +387,12 @@ export function initMerge(msg: InitMergeMessage) {
   local.onMouseDown((e) => {
     if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return;
     const line = e.target.position?.lineNumber; if (!line) return;
-    const h = findHunkAtLine('local', line); if (h) applyMergeHunk(h, 'local');
+    const h = findHunkAtLine('local', line); if (h) handleConflictClick(h, 'local');
   });
   remote.onMouseDown((e) => {
     if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return;
     const line = e.target.position?.lineNumber; if (!line) return;
-    const h = findHunkAtLine('remote', line); if (h) applyMergeHunk(h, 'remote');
+    const h = findHunkAtLine('remote', line); if (h) handleConflictClick(h, 'remote');
   });
 
   result.getModel()!.onDidChangeContent(() => {
@@ -390,11 +445,11 @@ export function initMerge(msg: InitMergeMessage) {
     } else if (e.altKey && e.shiftKey && (e.key === ',' || e.key === '<')) {
       e.preventDefault();
       const cur = currentResultLineHunk();
-      if (cur) applyMergeHunk(cur, 'local');
+      if (cur) handleConflictClick(cur, 'local');
     } else if (e.altKey && e.shiftKey && (e.key === '.' || e.key === '>')) {
       e.preventDefault();
       const cur = currentResultLineHunk();
-      if (cur) applyMergeHunk(cur, 'remote');
+      if (cur) handleConflictClick(cur, 'remote');
     }
   });
 
@@ -414,6 +469,17 @@ export function initMerge(msg: InitMergeMessage) {
     granSelect.onchange = () => {
       mergeGranularity = granSelect.value as Granularity;
       decorateMerge();
+    };
+  }
+  const wsSelect = document.getElementById('mergeIgnoreWS') as HTMLSelectElement | null;
+  if (wsSelect) {
+    syncIgnoreWSSelect(msg.ignoreWS);
+    wsSelect.onchange = () => {
+      vscode.postMessage({
+        type: 'setMergeIgnoreWS',
+        ignoreWS: wsSelect.value as 'none' | 'trim' | 'inner' | 'whole',
+        dirty
+      });
     };
   }
   byId('cancel').onclick = () => {

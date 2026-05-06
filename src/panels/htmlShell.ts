@@ -49,6 +49,12 @@ export function renderShell(
       </div>
       <div class="actions-separator"></div>
       <div class="actions-group">
+        <select id="mergeIgnoreWS" class="action-select" title="Whitespace handling" aria-label="Whitespace handling">
+          <option value="none">Do not ignore</option>
+          <option value="trim">Trim whitespace</option>
+          <option value="inner">Ignore whitespace</option>
+          <option value="whole">Ignore all whitespace</option>
+        </select>
         <select id="mergeGranularity" class="action-select" title="Intra-line diff granularity" aria-label="Diff granularity">
           <option value="char">Char</option>
           <option value="word">Word</option>

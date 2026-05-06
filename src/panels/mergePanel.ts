@@ -8,11 +8,13 @@ import { buildThreeWayHunks, hasConflictMarkers } from '../diff/threeWay';
 import { detectLanguage } from './language';
 import { renderShell } from './htmlShell';
 import type { WebviewToExt, InitMergeMessage } from '../types';
+import type { IgnoreWhitespace } from '../diff/whitespace';
 
 export class MergePanel {
   private files: string[] = [];   // repo-relative
   private fileIndex = 0;
   private repoRoot = '';
+  private ignoreWS: IgnoreWhitespace = 'none';
 
   private constructor(private readonly panel: vscode.WebviewPanel) {
     panel.webview.onDidReceiveMessage((msg: WebviewToExt) => this.handle(msg));
@@ -56,7 +58,7 @@ export class MergePanel {
   }
 
   private async postInit(local: string, base: string, remote: string) {
-    const { hunks } = buildThreeWayHunks(local, base, remote);
+    const { hunks } = buildThreeWayHunks(local, base, remote, this.ignoreWS);
     const fsPath = path.join(this.repoRoot, this.currentRel);
     this.panel.title = `Merge: ${path.basename(fsPath)}`;
     const init: InitMergeMessage = {
@@ -66,7 +68,8 @@ export class MergePanel {
       language: detectLanguage(fsPath),
       local, base, remote, hunks,
       files: this.files,
-      fileIndex: this.fileIndex
+      fileIndex: this.fileIndex,
+      ignoreWS: this.ignoreWS
     };
     this.panel.webview.postMessage(init);
   }
@@ -111,6 +114,22 @@ export class MergePanel {
       } catch (e: unknown) {
         vscode.window.showErrorMessage(`Save failed: ${(e as Error).message ?? e}`);
       }
+    } else if (msg.type === 'setMergeIgnoreWS') {
+      if (msg.ignoreWS === this.ignoreWS) return;
+      if (msg.dirty) {
+        const choice = await vscode.window.showWarningMessage(
+          `Changing whitespace mode will discard your edits to ${this.currentRel}.`,
+          { modal: true },
+          'Discard'
+        );
+        if (choice !== 'Discard') {
+          // Bounce the user's selection back by re-posting current init
+          await this.loadFileAt(this.fileIndex);
+          return;
+        }
+      }
+      this.ignoreWS = msg.ignoreWS;
+      await this.loadFileAt(this.fileIndex);
     } else if (msg.type === 'switchMergeFile') {
       const target = this.fileIndex + msg.direction;
       if (target < 0 || target >= this.files.length) return;

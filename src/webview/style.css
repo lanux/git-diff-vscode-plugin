@@ -142,8 +142,11 @@ body[data-mode="compare"] #mergeRoot { display: none; }
 
 /* glyph margin chevrons */
 .action-glyph { cursor: pointer; font-weight: bold; color: var(--vscode-textLink-foreground); }
-.action-glyph.right::after { content: '\00BB'; }
-.action-glyph.left::after { content: '\00AB'; }
+.action-glyph.right::after { content: '\00BB'; }       /* » apply from this side */
+.action-glyph.left::after { content: '\00AB'; }        /* « apply from this side */
+.action-glyph.append-right::after { content: '\2913'; }/* ⤓ append this side after the other */
+.action-glyph.append-left::after { content: '\2913'; } /* ⤓ append this side before the other */
+.action-glyph.revert::after { content: '\00D7'; color: var(--vscode-errorForeground); } /* × revert */
 
 /* ===== compare layout ===== */
 #compareRoot { display: flex; flex-direction: column; flex: 1; min-height: 0; }

@@ -1,5 +1,6 @@
 import { diff3Merge } from 'node-diff3';
 import { Hunk } from '../types';
+import { IgnoreWhitespace, normalizeLine } from './whitespace';
 
 export interface BuildResult {
   hunks: Hunk[];
@@ -18,7 +19,12 @@ interface Diff3Region {
   conflict?: { a: string[]; o: string[]; b: string[]; aIndex: number; oIndex: number; bIndex: number };
 }
 
-export function buildThreeWayHunks(local: string, base: string, remote: string): BuildResult {
+export function buildThreeWayHunks(
+  local: string,
+  base: string,
+  remote: string,
+  ignoreWS: IgnoreWhitespace = 'none'
+): BuildResult {
   const localLines = splitLines(local);
   const baseLines = splitLines(base);
   const remoteLines = splitLines(remote);
@@ -85,7 +91,37 @@ export function buildThreeWayHunks(local: string, base: string, remote: string):
     });
   }
 
-  return { hunks, initialResult: allResultLines.join('\n') };
+  // ignoreWS post-process: demote conflicts whose two sides are equal under normalization.
+  // Matches IDEA's "Ignore whitespace" behavior (keep the local/left formatting).
+  if (ignoreWS !== 'none') {
+    for (const h of hunks) {
+      if (h.kind !== 'conflict') continue;
+      if (linesNormalizedEqual(h.localLines, h.remoteLines, ignoreWS)) {
+        h.kind = 'auto';
+        h.resolvedLines = h.localLines.slice();
+        h.status = 'manual';
+      }
+    }
+  }
+
+  const resultText = hunks.length
+    ? rebuildResultFromHunks(hunks)
+    : allResultLines.join('\n');
+  return { hunks, initialResult: resultText };
+}
+
+function linesNormalizedEqual(a: string[], b: string[], mode: IgnoreWhitespace): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (normalizeLine(a[i], mode) !== normalizeLine(b[i], mode)) return false;
+  }
+  return true;
+}
+
+function rebuildResultFromHunks(hunks: Hunk[]): string {
+  const out: string[] = [];
+  for (const h of hunks) out.push(...h.resolvedLines);
+  return out.join('\n');
 }
 
 export function hasConflictMarkers(text: string): boolean {

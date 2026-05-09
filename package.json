@@ -2,7 +2,7 @@
   "name": "git-diff-fast",
   "displayName": "Git Diff Fast",
   "description": "Fast three-way merge conflict resolver and branch compare tool for VS Code",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "lanux",
   "license": "Apache-2.0",
   "icon": "icon.png",
@@ -65,6 +65,16 @@
           "group": "3_compare@2"
         }
       ]
+    },
+    "configuration": {
+      "title": "Git Diff Fast",
+      "properties": {
+        "gitDiff.merge.autoApplyNonConflicts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically apply non-conflicting changes after initializing the merge result from the base version."
+        }
+      }
     }
   },
   "scripts": {

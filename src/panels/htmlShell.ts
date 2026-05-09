@@ -43,7 +43,7 @@ export function renderShell(
       <div class="actions-separator"></div>
       <div class="actions-group">
         <button id="applyL" class="action-btn" title="Apply all non-conflicting from Local (Alt+Shift+,)" aria-label="Apply from Local"><span class="codicon codicon-arrow-right"></span></button>
-        <button id="applyB" class="action-btn" title="Restore all non-conflicting to auto-merged result" aria-label="Restore auto-merged"><span class="codicon codicon-arrow-swap"></span></button>
+        <button id="applyB" class="action-btn" title="Apply All Non-Conflicts" aria-label="Apply All Non-Conflicts"><span class="codicon codicon-arrow-swap"></span></button>
         <button id="applyR" class="action-btn" title="Apply all non-conflicting from Remote (Alt+Shift+.)" aria-label="Apply from Remote"><span class="codicon codicon-arrow-left"></span></button>
         <button id="magic" class="action-btn" title="Magic Resolve: auto-resolve whitespace-only and pure import conflicts" aria-label="Magic Resolve"><span class="codicon codicon-wand"></span></button>
       </div>
@@ -64,6 +64,8 @@ export function renderShell(
       <span id="title" class="action-label file-path-label"></span>
       <span class="spacer"></span>
       <div class="actions-group">
+        <button id="acceptLeft" class="action-btn" title="Accept Local Revision (use Local for entire file)" aria-label="Accept Local Revision">L</button>
+        <button id="acceptRight" class="action-btn" title="Accept Remote Revision (use Remote for entire file)" aria-label="Accept Remote Revision">R</button>
         <button id="accept" class="action-btn primary" title="Accept Merge" aria-label="Accept Merge"><span class="codicon codicon-check"></span></button>
         <button id="cancel" class="action-btn" title="Cancel" aria-label="Cancel"><span class="codicon codicon-close"></span></button>
       </div>

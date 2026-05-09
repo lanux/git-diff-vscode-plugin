@@ -1,6 +1,8 @@
 import { diff3Merge } from 'node-diff3';
 import { Hunk } from '../types';
 import { IgnoreWhitespace, normalizeLine } from './whitespace';
+import { classifyFragment } from './mergeConflictType';
+import { tryResolveConflict } from './conflictResolve';
 
 export interface BuildResult {
   hunks: Hunk[];
@@ -51,24 +53,36 @@ export function buildThreeWayHunks(
       const remoteSlice = remoteLines.slice(ri, c.bIndex);
 
       if (localSlice.length > 0 || baseSlice.length > 0 || remoteSlice.length > 0) {
+        const autoResolved = allResultLines.slice(resultStart);
+        const ct = classifyFragment(localSlice, baseSlice, remoteSlice, ignoreWS);
         hunks.push({
           id: id++, kind: 'auto',
           localLines: localSlice,
           baseLines: baseSlice,
           remoteLines: remoteSlice,
-          resolvedLines: allResultLines.slice(resultStart),
-          status: 'manual'
+          resolvedLines: autoResolved,
+          status: 'manual',
+          conflictType: ct,
+          resolved: [false, false],
+          isOnesideAppliedConflict: false,
+          lastAppliedSnapshot: autoResolved.slice()
         });
       }
 
-      // Conflict hunk
+      // Conflict hunk — pass tryResolveConflict so resolutionStrategy gets set
+      // to TEXT when the magic wand can auto-merge it (IDEA design.md §3.2).
+      const conflictCT = classifyFragment(c.a, c.o, c.b, ignoreWS, tryResolveConflict);
       hunks.push({
         id: id++, kind: 'conflict',
         localLines: c.a.slice(),
         baseLines: c.o.slice(),
         remoteLines: c.b.slice(),
         resolvedLines: [],
-        status: 'pending'
+        status: 'pending',
+        conflictType: conflictCT,
+        resolved: [false, false],
+        isOnesideAppliedConflict: false,
+        lastAppliedSnapshot: []
       });
 
       // Advance positions past this conflict
@@ -81,13 +95,22 @@ export function buildThreeWayHunks(
 
   // Remaining lines after the last conflict (or entire file if no conflicts)
   if (li < localLines.length || bi < baseLines.length || ri < remoteLines.length) {
+    const tailLocal = localLines.slice(li);
+    const tailBase = baseLines.slice(bi);
+    const tailRemote = remoteLines.slice(ri);
+    const tailResolved = allResultLines.slice(resultStart);
+    const ct = classifyFragment(tailLocal, tailBase, tailRemote, ignoreWS);
     hunks.push({
       id: id++, kind: 'auto',
-      localLines: localLines.slice(li),
-      baseLines: baseLines.slice(bi),
-      remoteLines: remoteLines.slice(ri),
-      resolvedLines: allResultLines.slice(resultStart),
-      status: 'manual'
+      localLines: tailLocal,
+      baseLines: tailBase,
+      remoteLines: tailRemote,
+      resolvedLines: tailResolved,
+      status: 'manual',
+      conflictType: ct,
+      resolved: [false, false],
+      isOnesideAppliedConflict: false,
+      lastAppliedSnapshot: tailResolved.slice()
     });
   }
 

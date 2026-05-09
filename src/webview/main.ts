@@ -13,7 +13,7 @@ window.addEventListener('message', (e) => {
   } else if (msg.type === 'fileDiff') {
     showFileDiff(msg);
   } else if (msg.type === 'requestResult') {
-    vscode.postMessage({ type: 'saveMerge', content: getResultContent() });
+    vscode.postMessage({ type: 'finishMerge', result: 'RESOLVED', outputText: getResultContent(), dirty: true });
   }
 });
 

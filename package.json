@@ -42,7 +42,12 @@
       },
       {
         "command": "gitCompare.compare",
-        "title": "Compare",
+        "title": "Compare with Branch/Commit",
+        "category": "Git Compare"
+      },
+      {
+        "command": "gitCompare.compareProject",
+        "title": "Compare Project with Branch/Commit",
         "category": "Git Compare"
       }
     ],
@@ -73,6 +78,62 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically apply non-conflicting changes after initializing the merge result from the base version."
+        },
+        "gitDiff.merge.autoResolveImports": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically resolve merge hunks that contain only import/include/require lines."
+        },
+        "gitDiff.merge.autoScroll": {
+          "type": "boolean",
+          "default": true,
+          "description": "Synchronize the three merge editors while scrolling. Can still be toggled from the merge toolbar."
+        },
+        "gitDiff.merge.additionalActions": {
+          "type": "array",
+          "default": [],
+          "description": "Additional VS Code commands to expose inside merge editor context menus.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "label",
+              "command"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable identifier for the merge action."
+              },
+              "label": {
+                "type": "string",
+                "description": "Label shown in the merge editor context menu."
+              },
+              "command": {
+                "type": "string",
+                "description": "VS Code command id to execute."
+              },
+              "pane": {
+                "type": "string",
+                "enum": [
+                  "local",
+                  "result",
+                  "remote",
+                  "all"
+                ],
+                "default": "result",
+                "description": "Which merge pane should expose this action."
+              },
+              "contextMenuGroupId": {
+                "type": "string",
+                "description": "Optional Monaco context menu group id."
+              },
+              "contextMenuOrder": {
+                "type": "number",
+                "description": "Optional Monaco context menu ordering hint."
+              }
+            }
+          }
         }
       }
     }
@@ -86,8 +147,7 @@
   },
   "dependencies": {
     "@vscode/codicons": "^0.0.45",
-    "monaco-editor": "^0.55.1",
-    "node-diff3": "^3.2.0"
+    "monaco-editor": "^0.55.1"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

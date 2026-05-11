@@ -1,54 +1,24 @@
-import { Hunk } from '../types';
-import { normalizeLine } from './whitespace';
-
-const IMPORT_LINE = /^\s*(?:import\b|from\s+\S+\s+import\b|#include\b|using\s+\w+\b|require\s*\()/;
+import type { MergeChange } from '../types';
+import { isChangeRangeModified, MergeConflictModel } from './merge/mergeModel';
 
 /**
- * Heuristically resolve conflicts:
- *  - whitespace-only differences → keep local
- *  - both sides are pure import/require blocks → take sorted union (de-duped)
- * Returns the number of hunks resolved.
+ * Magic Resolve — auto-resolve every still-pending conflict hunk that can be
+ * resolved. Backs the toolbar "Resolve Simple Conflicts" wand and the per-hunk
+ * BASE-column wand (design.md §8). Mirrors IntelliJ's
+ * `resolveChangeAutomatically(BASE)` path only; import-only and whitespace-only
+ * shortcuts are handled elsewhere in the pipeline rather than being special
+ * cases here.
+ * Hunks whose result range the user has hand-edited (`isChangeRangeModified`)
+ * are skipped. Returns the ids of the hunks that changed.
  */
-export function magicResolve(hunks: Hunk[]): number {
-  let resolved = 0;
+export function magicResolve(hunks: MergeChange[]): number[] {
+  const model = new MergeConflictModel(hunks);
+  const changed: number[] = [];
   for (const h of hunks) {
     if (h.kind !== 'conflict' || h.status !== 'pending') continue;
+    if (isChangeRangeModified(h)) continue;
 
-    if (linesEqualIgnoringWS(h.localLines, h.remoteLines)) {
-      h.resolvedLines = h.localLines.slice();
-      h.status = 'accepted-local';
-      resolved++;
-      continue;
-    }
-
-    if (allImportLines(h.localLines) && allImportLines(h.remoteLines)) {
-      const merged = Array.from(new Set([...h.localLines, ...h.remoteLines]))
-        .filter((l) => l.trim().length > 0)
-        .sort();
-      h.resolvedLines = merged;
-      h.status = 'accepted-both';
-      resolved++;
-    }
+    if (model.resolveChangeAutomatically(h, 'base')) changed.push(h.id);
   }
-  return resolved;
-}
-
-function linesEqualIgnoringWS(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) {
-    const an = a.map((l) => normalizeLine(l, 'whole')).filter((l) => l.length > 0);
-    const bn = b.map((l) => normalizeLine(l, 'whole')).filter((l) => l.length > 0);
-    if (an.length !== bn.length) return false;
-    for (let i = 0; i < an.length; i++) if (an[i] !== bn[i]) return false;
-    return true;
-  }
-  for (let i = 0; i < a.length; i++) {
-    if (normalizeLine(a[i], 'whole') !== normalizeLine(b[i], 'whole')) return false;
-  }
-  return true;
-}
-
-function allImportLines(lines: string[]): boolean {
-  const meaningful = lines.filter((l) => l.trim().length > 0);
-  if (meaningful.length === 0) return false;
-  return meaningful.every((l) => IMPORT_LINE.test(l));
+  return changed;
 }

@@ -18,6 +18,7 @@ interface CompareState {
   current: string;
   target: string;
   rootPath: string;
+  scopeLabel?: string;
   selected: string | null;
   left: PaneCtx | null;
   right: PaneCtx | null;
@@ -67,6 +68,7 @@ export function initCompare(msg: InitCompareMessage) {
   setMode('compare');
   compare = {
     files: msg.files, current: msg.current, target: msg.target, rootPath: msg.rootPath,
+    scopeLabel: msg.scopeLabel,
     selected: null, left: null, right: null, ranges: null, hunks: null,
     editable: false, currentPath: null, ignoreWS: 'none', granularity: 'char',
     baselineText: ''
@@ -79,7 +81,8 @@ export function initCompare(msg: InitCompareMessage) {
     counts.D ? `${counts.D} deleted` : '',
     counts.R ? `${counts.R} renamed` : ''
   ].filter(Boolean).join(', ') || 'no changes';
-  setText('compareTitle', `${msg.current}  \u21C4  ${msg.target}   \u2014   ${summary}`);
+  const scope = msg.scopeLabel ? `${msg.scopeLabel}  |  ` : '';
+  setText('compareTitle', `${scope}${msg.current}  \u21C4  ${msg.target}   \u2014   ${summary}`);
   const groupBy = (document.getElementById('cmpGroupBy') as HTMLSelectElement | null)?.value ?? 'dir';
   renderTree(byId('tree'), msg.files, selectFile, groupBy as 'dir' | 'flat');
   if (msg.files.length === 1) selectFile(msg.files[0].path);
@@ -102,6 +105,10 @@ function selectFile(path: string) {
     (el as HTMLElement).classList.toggle('selected', (el as HTMLElement).dataset.path === path);
   }
   vscode.postMessage({ type: 'requestFileDiff', path, ignoreWS: compare.ignoreWS });
+}
+
+export function selectCompareFile(path: string) {
+  selectFile(path);
 }
 
 export function showFileDiff(msg: FileDiffMessage) {

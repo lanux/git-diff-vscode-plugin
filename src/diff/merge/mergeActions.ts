@@ -1,10 +1,10 @@
-import type { Hunk } from '../../types';
+import type { MergeChange } from '../../types';
 
-export function isResolved(hunk: Hunk): boolean {
+export function isResolved(hunk: MergeChange): boolean {
   return (hunk.resolved?.[0] ?? false) && (hunk.resolved?.[1] ?? false);
 }
 
-export function resetResolvedChangeState(hunk: Hunk, force = false): boolean {
+export function resetResolvedChangeState(hunk: MergeChange, force = false): boolean {
   if (hunk.kind !== 'auto' && hunk.kind !== 'conflict') return false;
   if (!force && !isResolved(hunk)) return false;
 
@@ -39,7 +39,7 @@ export function resetResolvedChangeState(hunk: Hunk, force = false): boolean {
   return before !== after;
 }
 
-export function replaceChangeWithAiState(hunk: Hunk, newContentLines: readonly string[]): boolean {
+export function replaceChangeWithAiState(hunk: MergeChange, newContentLines: readonly string[]): boolean {
   if (hunk.kind !== 'auto' && hunk.kind !== 'conflict') return false;
   if (isResolved(hunk)) return false;
 

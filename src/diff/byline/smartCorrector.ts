@@ -1,7 +1,7 @@
 import { buildChangesFromObjects, changesToRanges } from './diff';
 import { ChangeBuilder, create, fair } from './iterable';
 import type { Line } from './line';
-import { computeLcsChangesWithFallback } from './patienceLcs';
+import { defaultLcsComputer } from './patienceLcs';
 import { expandRange } from './trimUtil';
 import type { FairDiffIterable } from './types';
 
@@ -10,18 +10,19 @@ export const UNIMPORTANT_LINE_CHAR_COUNT = 3;
 export function compareSmart(
   lines1: readonly Line[],
   lines2: readonly Line[],
-  threshold = UNIMPORTANT_LINE_CHAR_COUNT
+  threshold = UNIMPORTANT_LINE_CHAR_COUNT,
+  usePatienceAlg?: boolean
 ): FairDiffIterable {
-  if (threshold === 0) return diffLines(lines1, lines2);
+  if (threshold === 0) return diffLines(lines1, lines2, usePatienceAlg);
 
   const bigLines1 = getBigLines(lines1, threshold);
   const bigLines2 = getBigLines(lines2, threshold);
-  const changes = diffLines(bigLines1.lines, bigLines2.lines);
+  const changes = diffLines(bigLines1.lines, bigLines2.lines, usePatienceAlg);
   return new SmartLineChangeCorrector(bigLines1.indexes, bigLines2.indexes, lines1, lines2, changes).build();
 }
 
-export function diffLines(lines1: readonly Line[], lines2: readonly Line[]): FairDiffIterable {
-  const change = buildChangesFromObjects(lines1, lines2, computeLcsChangesWithFallback, {
+export function diffLines(lines1: readonly Line[], lines2: readonly Line[], usePatienceAlg?: boolean): FairDiffIterable {
+  const change = buildChangesFromObjects(lines1, lines2, defaultLcsComputer(usePatienceAlg), {
     equals: (left, right) => left.equals(right),
     keyOf: (line) => line.key
   });

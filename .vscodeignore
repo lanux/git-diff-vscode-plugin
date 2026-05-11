@@ -11,5 +11,7 @@ out/**/*.map
 **/.eslintrc*
 **/CLAUDE.md
 **/prd-*.md
+.omc/**
+modify.md
 .claude/**
 docs/**

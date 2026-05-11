@@ -1,15 +1,24 @@
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api.js';
-import type { Hunk, InitMergeMessage } from '../../types';
+import type {
+  InitMergeMessage,
+  LineRange,
+  MergeActionPane,
+  MergeAdditionalActionDescriptor,
+  MergeChange
+} from '../../types';
 import { buildAlignedThree } from '../diff/align';
-import type { LineRange } from '../diff/align';
 import { byId, setText, setMode } from '../components/toolbar';
 import { Ribbon } from '../components/ribbon';
-import { wordDiff, wordTokenDiff, type Granularity } from '../diff/wordDiff';
-import { tryResolveConflict } from '../../diff/conflictResolve';
+import type { Granularity } from '../diff/wordDiff';
+import { isImportBlock, mergeImportBlocks } from '../../diff/importResolve';
+import { magicResolve } from '../../diff/magicResolve';
 import { vscode, getVsCodeTheme } from '../api';
-import { isResolved, resetResolvedChangeState } from './mergeActions';
+import { isResolved } from '../../diff/merge/mergeActions';
+import { computeCollapsedUnchangedAreas, type HiddenArea } from '../../diff/merge/collapseUnchanged';
 import { MergeLineTracker } from './mergeLineTracker';
-import { MergeConflictModel } from './mergeModel';
+import { isChangeRangeModified, isSideChanged, linesEqualArr, MergeConflictModel } from '../../diff/merge/mergeModel';
+import { InnerDiffScheduler } from './mergeInnerDiff';
+import { closePartialCompare, isPartialCompareOpen, showPartialCompare, showWholeFileCompare } from './mergePartialCompare';
 import {
   applyMergeSnapshot,
   createMergeSnapshot,
@@ -23,7 +32,7 @@ interface PaneCtx {
 }
 
 interface MergeState {
-  hunks: Hunk[];
+  hunks: MergeChange[];
   local: PaneCtx; result: PaneCtx; remote: PaneCtx;
   ranges: Map<number, { local: LineRange; result: LineRange; remote: LineRange }>;
   localTracker: MergeLineTracker;
@@ -32,8 +41,13 @@ interface MergeState {
   model: MergeConflictModel;
   filePath: string;
   language: string;
+  localText: string;
+  baseText: string;
+  remoteText: string;
   files: string[];
   fileIndex: number;
+  ignoreWS: 'none' | 'trim' | 'inner' | 'whole';
+  additionalActions: MergeAdditionalActionDescriptor[];
 }
 
 let merge: MergeState | null = null;
@@ -46,11 +60,14 @@ let decorateRaf = 0;
 let updateRibbonsFn: (() => void) | null = null;
 let mergeGranularity: Granularity = 'char';
 let modifierShift = false;
+const innerDiffScheduler = new InnerDiffScheduler();
 const mergeUndoStack = new MergeUndoStack();
 let lastMergeSnapshot: MergeSnapshot | null = null;
 // Snapshot of each auto hunk's IDEA auto-merged content. The visible result
 // starts from BASE and may opt into these lines during initialization.
 let autoResolved: Map<number, string[]> = new Map();
+let collapseUnchanged = false;
+let autoScrollEnabled = true;
 
 function makeEditor(container: HTMLElement, value: string, language: string, readOnly: boolean) {
   return monaco.editor.create(container, {
@@ -83,9 +100,9 @@ function stripeFor(range: LineRange, color: string): monaco.editor.IModelDeltaDe
 }
 
 // Per-hunk magic-wand glyphs in the BASE/result column for conflicts whose
-// conflictType.resolutionStrategy is TEXT (matches IDEA design.md §8 inline
+// conflictType.resolutionStrategy is TEXT (matches IDEA design.md section 8 inline
 // resolveRenderer).
-const magicGutterByLine = new Map<number, number>(); // result line → hunk id
+const magicGutterByLine = new Map<number, number>(); // result line -> hunk id
 
 function decorateMerge() {
   if (!merge) return;
@@ -114,14 +131,17 @@ function decorateMerge() {
       ld.push(stripeFor(r.local, stripeColor));
       remd.push(stripeFor(r.remote, stripeColor));
     } else if (h.kind === 'conflict') {
-      const cls = h.status === 'pending' ? 'hunk-conflict-pending' : 'hunk-resolved';
-      // IDEA design.md §7.6 glyph table:
-      //   pending          → unresolved sides show »/« (Apply, replaces result)
-      //   Shift held       → unresolved sides show × (Ignore)
-      //   one-side applied → applied side has NO glyph; opposite side shows ↓ (Append)
-      //   fully resolved   → both sides have NO glyph
+      // IDEA design.md §7.6: a conflict stays in the "unresolved" color until
+      // BOTH sides are resolved — a one-side-applied conflict (Apply Both step 1)
+      // is still highlighted as a conflict, only the applied side's glyph is gone.
       const resolved = h.resolved ?? [false, false];
       const fullyResolved = resolved[0] && resolved[1];
+      const cls = fullyResolved ? 'hunk-resolved' : 'hunk-conflict-pending';
+      // IDEA design.md section 7.6 glyph table:
+      //   pending          -> unresolved sides show apply glyphs.
+      //   Shift held       -> unresolved sides show ignore glyphs.
+      //   one-side applied -> applied side has no glyph; opposite side appends.
+      //   fully resolved   -> both sides have no glyph.
       let leftGlyph: string | undefined;
       let rightGlyph: string | undefined;
       if (fullyResolved) {
@@ -131,8 +151,7 @@ function decorateMerge() {
         leftGlyph = resolved[0] ? undefined : 'action-glyph revert';
         rightGlyph = resolved[1] ? undefined : 'action-glyph revert';
       } else if (h.isOnesideAppliedConflict) {
-        // Exactly one side is already applied — the other side's glyph
-        // becomes "↓ append".
+        // Exactly one side is already applied; the other side's glyph appends.
         if (resolved[0]) {
           leftGlyph = undefined;
           rightGlyph = 'action-glyph append-left';
@@ -156,46 +175,86 @@ function decorateMerge() {
         rd.push(decorationFor(r.result, cls));
       }
       remd.push(decorationFor(r.remote, cls, rightGlyph));
-      const stripeColor = h.status === 'pending' ? 'rgba(232,118,0,.8)' : 'rgba(98,150,85,.5)';
+      const stripeColor = fullyResolved ? 'rgba(98,150,85,.5)' : 'rgba(232,118,0,.8)';
       ld.push(stripeFor(r.local, stripeColor));
       remd.push(stripeFor(r.remote, stripeColor));
-      // Intra-line word diff for pending conflicts
-      if (h.status === 'pending' && mergeGranularity !== 'line') {
-        const max = Math.min(h.localLines.length, h.remoteLines.length);
-        const fn = mergeGranularity === 'word' ? wordTokenDiff : wordDiff;
-        for (let i = 0; i < max; i++) {
-          const wd = fn(h.localLines[i] ?? '', h.remoteLines[i] ?? '');
-          for (const cr of wd.left) {
-            ld.push({
-              range: new monaco.Range(r.local.start + i, cr.start + 1, r.local.start + i, cr.end + 1),
-              options: { className: 'word-diff' }
-            });
-          }
-          for (const cr of wd.right) {
-            remd.push({
-              range: new monaco.Range(r.remote.start + i, cr.start + 1, r.remote.start + i, cr.end + 1),
-              options: { className: 'word-diff' }
-            });
-          }
-        }
-      }
     }
   }
   merge.local.decorations = merge.local.editor.deltaDecorations(merge.local.decorations, ld);
   merge.result.decorations = merge.result.editor.deltaDecorations(merge.result.decorations, rd);
   merge.remote.decorations = merge.remote.editor.deltaDecorations(merge.remote.decorations, remd);
+  scheduleInnerDiff();
+  applyCollapsedUnchangedAreas();
   updateMergeCounter();
 }
 
+function applyCollapsedUnchangedAreas(): void {
+  if (!merge) return;
+
+  if (!collapseUnchanged) {
+    setEditorHiddenAreas(merge.local.editor, []);
+    setEditorHiddenAreas(merge.result.editor, []);
+    setEditorHiddenAreas(merge.remote.editor, []);
+    updateCollapseToggle();
+    return;
+  }
+
+  const hidden = computeCollapsedUnchangedAreas(merge.hunks, getTrackedRanges);
+  setEditorHiddenAreas(merge.local.editor, toMonacoHiddenAreas(hidden.local));
+  setEditorHiddenAreas(merge.result.editor, toMonacoHiddenAreas(hidden.result));
+  setEditorHiddenAreas(merge.remote.editor, toMonacoHiddenAreas(hidden.remote));
+  updateCollapseToggle();
+}
+
+type HiddenAreaCapableEditor = monaco.editor.IStandaloneCodeEditor & {
+  setHiddenAreas?: (ranges: monaco.Range[]) => void;
+};
+
+function setEditorHiddenAreas(editor: monaco.editor.IStandaloneCodeEditor, ranges: monaco.Range[]): void {
+  (editor as HiddenAreaCapableEditor).setHiddenAreas?.(ranges);
+}
+
+function toMonacoHiddenAreas(hiddenAreas: readonly HiddenArea[]): monaco.Range[] {
+  return hiddenAreas.map((hiddenArea) => new monaco.Range(hiddenArea.startLine, 1, hiddenArea.endLine, 1));
+}
+
+function updateCollapseToggle(): void {
+  const button = document.getElementById('collapseUnchanged') as HTMLButtonElement | null;
+  if (!button) return;
+  button.classList.toggle('active', collapseUnchanged);
+  button.setAttribute('aria-pressed', String(collapseUnchanged));
+  button.title = collapseUnchanged ? 'Expand unchanged sections' : 'Collapse unchanged sections';
+}
+
+function updateAutoScrollToggle(): void {
+  const button = document.getElementById('autoScroll') as HTMLButtonElement | null;
+  if (!button) return;
+  button.classList.toggle('active', autoScrollEnabled);
+  button.setAttribute('aria-pressed', String(autoScrollEnabled));
+  button.title = autoScrollEnabled ? 'Disable synchronized scrolling' : 'Enable synchronized scrolling';
+}
+
+function scheduleInnerDiff(): void {
+  if (!merge) return;
+  innerDiffScheduler.schedule({
+    hunks: merge.hunks,
+    localEditor: merge.local.editor,
+    resultEditor: merge.result.editor,
+    remoteEditor: merge.remote.editor,
+    getRanges: getTrackedRanges
+  }, mergeGranularity);
+}
+
 // Once all conflicts are processed for this file we want a one-shot
-// celebratory toast — mirrors IDEA's "merge.all.changes.processed" bubble
-// (design.md §3.5). Tracks the previous-pending count so we only fire on the
-// 1→0 transition, not on every re-render.
+// completion toast mirroring IDEA's "merge.all.changes.processed" bubble.
+// Tracks the previous-pending count so we only fire on the 1->0 transition.
 let prevPendingCount = -1;
 
 function updateMergeCounter() {
   if (!merge) return;
-  const pending = merge.hunks.filter((h) => h.kind === 'conflict' && h.status === 'pending').length;
+  // A conflict is "unresolved" until BOTH sides are resolved — a one-side-applied
+  // conflict (Apply Both step 1) still counts (IDEA design.md §7.5–§7.6).
+  const pending = merge.hunks.filter((h) => h.kind === 'conflict' && !isResolved(h)).length;
   const changes = merge.hunks.filter((h) => h.kind === 'conflict' || h.kind === 'auto').length;
   setText(
     'counter',
@@ -203,21 +262,25 @@ function updateMergeCounter() {
   );
   const acceptBtn = document.getElementById('accept') as HTMLButtonElement;
   if (acceptBtn) {
-    acceptBtn.disabled = pending > 0;
-    acceptBtn.title = pending > 0 ? `${pending} unresolved conflict${pending === 1 ? '' : 's'} remaining` : 'Accept merge and stage file';
+    // IDEA design.md §5.3/§12: Apply is always available; the host confirms
+    // before saving when conflicts are still unresolved.
+    acceptBtn.disabled = false;
+    acceptBtn.title = pending > 0
+      ? `${pending} unresolved conflict${pending === 1 ? '' : 's'} — will be left as-is`
+      : 'Accept merge and stage file';
   }
   const prevFileBtn = document.getElementById('prevFile') as HTMLButtonElement | null;
   const nextFileBtn = document.getElementById('nextFile') as HTMLButtonElement | null;
   if (prevFileBtn) prevFileBtn.disabled = merge.fileIndex <= 0;
   if (nextFileBtn) nextFileBtn.disabled = merge.fileIndex >= merge.files.length - 1;
 
-  // Edge-trigger when conflicts go from N>0 to 0 — flash the counter so the
+  // Edge-trigger when conflicts go from N>0 to 0 鈥?flash the counter so the
   // user knows they can now Accept.
   const counter = document.getElementById('counter');
   if (counter) {
     if (prevPendingCount > 0 && pending === 0) {
       counter.classList.add('all-resolved');
-      counter.textContent = `✓ All changes processed.`;
+      counter.textContent = 'All changes processed.';
       setTimeout(() => counter.classList.remove('all-resolved'), 2500);
     }
   }
@@ -244,14 +307,14 @@ function extractPaneRanges(
   return paneRanges;
 }
 
-function buildPaneBlock(hunk: Hunk, pane: 'local' | 'result' | 'remote', length: number): string[] {
+function buildPaneBlock(hunk: MergeChange, pane: 'local' | 'result' | 'remote', length: number): string[] {
   const source = pane === 'local' ? hunk.localLines : pane === 'remote' ? hunk.remoteLines : hunk.resolvedLines;
   const out = source.slice();
   while (out.length < length) out.push('');
   return out;
 }
 
-function findHunkAtLine(side: 'local' | 'remote', line: number): Hunk | undefined {
+function findHunkAtLine(side: 'local' | 'remote', line: number): MergeChange | undefined {
   if (!merge) return;
   for (const h of merge.hunks) {
     if (h.kind !== 'conflict' && !isSideChanged(h, side)) continue;
@@ -260,7 +323,7 @@ function findHunkAtLine(side: 'local' | 'remote', line: number): Hunk | undefine
   }
 }
 
-function currentResultLineHunk(): Hunk | undefined {
+function currentResultLineHunk(): MergeChange | undefined {
   if (!merge) return;
   const line = merge.result.editor.getPosition()?.lineNumber ?? 1;
   for (const h of merge.hunks) {
@@ -271,7 +334,7 @@ function currentResultLineHunk(): Hunk | undefined {
   return merge.hunks.find((h) => h.kind === 'conflict' && h.status === 'pending');
 }
 
-function currentResultChangeHunk(): Hunk | undefined {
+function currentResultChangeHunk(): MergeChange | undefined {
   if (!merge) return;
   const line = merge.result.editor.getPosition()?.lineNumber ?? 1;
   for (const h of merge.hunks) {
@@ -281,7 +344,32 @@ function currentResultChangeHunk(): Hunk | undefined {
   }
 }
 
-function currentSideChangeHunk(side: 'local' | 'remote'): Hunk | undefined {
+function showCompareContents(): void {
+  if (!merge) return;
+  const mode = (document.getElementById('compareContentsMode') as HTMLSelectElement | null)?.value ?? 'change-local-base';
+  if (mode.startsWith('file-')) {
+    showWholeFileCompare({
+      local: merge.localText,
+      base: merge.baseText,
+      remote: merge.remoteText
+    }, merge.language);
+    return;
+  }
+
+  const hunk = currentResultChangeHunk() ?? currentSideChangeHunk('local') ?? currentSideChangeHunk('remote');
+  if (!hunk) return;
+  showPartialCompare(hunk, merge.language, { revealMainChange: () => revealMergeHunk(hunk.id) });
+}
+
+function revealMergeHunk(hunkId: number): void {
+  if (!merge) return;
+  const range = getTrackedRanges(hunkId).result;
+  merge.result.editor.revealLineInCenter(range.start);
+  merge.result.editor.setPosition({ lineNumber: range.start, column: 1 });
+  merge.result.editor.focus();
+}
+
+function currentSideChangeHunk(side: 'local' | 'remote'): MergeChange | undefined {
   if (!merge) return;
   const editor = side === 'local' ? merge.local.editor : merge.remote.editor;
   const line = editor.getPosition()?.lineNumber ?? 1;
@@ -290,6 +378,10 @@ function currentSideChangeHunk(side: 'local' | 'remote'): Hunk | undefined {
 
 export function getResultContent(): string {
   return merge?.result.editor.getValue() ?? '';
+}
+
+export function getUnresolvedConflictCount(): number {
+  return merge?.hunks.filter((h) => h.kind === 'conflict' && !isResolved(h)).length ?? 0;
 }
 
 function currentMergeSnapshot(dirtyValue = dirty): MergeSnapshot | null {
@@ -354,11 +446,11 @@ function recordManualEdit(): void {
 }
 
 // Click on a side's apply-arrow glyph for a conflict hunk.
-// IDEA semantics — MergeConflictModel.replaceChange (design.md §7.4):
-//   1. If THIS side is already resolved → no-op (return). IDEA does NOT
+// IDEA semantics: MergeConflictModel.replaceChange (design.md section 7.4):
+//   1. If THIS side is already resolved, no-op (return). IDEA does NOT
 //      support clicking the arrow to revert; revert goes through Undo or
 //      a separate Reset action.
-//   2. If THIS side has no change vs base (fragment empty) → simply mark
+//   2. If THIS side has no change vs base (fragment empty), simply mark
 //      resolved without modifying the result.
 //   3. Conflict + first apply: replace BASE with this side's content,
 //      mark this side resolved, set isOnesideAppliedConflict=true so the
@@ -371,248 +463,148 @@ function recordManualEdit(): void {
 //   6. After step 3, if the OPPOSITE side's source fragment is empty
 //      (e.g. a delete-on-the-other-side conflict), auto full-resolve
 //      because there's nothing to append.
-function handleConflictClick(hunk: Hunk, side: 'local' | 'remote', resolveChange: boolean = false) {
+function handleConflictClick(hunk: MergeChange, side: 'local' | 'remote', resolveChange: boolean = false) {
   if (!merge || hunk.kind !== 'conflict') return;
   syncResultEditsFromTracker();
-  if (!hunk.resolved) hunk.resolved = [false, false];
-  const sideIdx = side === 'local' ? 0 : 1;
-  const oppositeIdx = 1 - sideIdx;
-  const isAlreadyResolvedHere = hunk.resolved[sideIdx];
-
-  // (1) Clicking on an already-resolved side: ignore (matches IDEA).
-  if (isAlreadyResolvedHere && !resolveChange) return;
-
-  const sourceLines = side === 'local' ? hunk.localLines : hunk.remoteLines;
-  const oppositeLines = side === 'local' ? hunk.remoteLines : hunk.localLines;
-  const oppositeIsEmpty = oppositeLines.length === 0;
-
-  // (5) Ctrl+Click → replace + full-resolve, drop opposite content.
-  if (resolveChange) {
-    hunk.resolvedLines = sourceLines.slice();
-    hunk.resolved = [true, true];
-    hunk.isOnesideAppliedConflict = false;
-    hunk.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
-  } else if (hunk.isOnesideAppliedConflict) {
-    // (4) Apply Both second step: append in click order.
-    hunk.resolvedLines = [...hunk.resolvedLines, ...sourceLines];
-    hunk.resolved = [true, true];
-    hunk.isOnesideAppliedConflict = false;
-    hunk.status = 'accepted-both';
-  } else {
-    // (3) First Apply: replace BASE with this side's content.
-    hunk.resolvedLines = sourceLines.slice();
-    hunk.resolved[sideIdx] = true;
-    hunk.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
-
-    // (6) Opposite side fragment is empty or already ignored/resolved →
-    // nothing to append; full-resolve.
-    if (hunk.resolved[oppositeIdx] || oppositeIsEmpty) {
-      hunk.resolved[oppositeIdx] = true;
-      hunk.isOnesideAppliedConflict = false;
-    } else {
-      hunk.isOnesideAppliedConflict = true;
-    }
-  }
-  hunk.lastAppliedSnapshot = hunk.resolvedLines.slice();
-  hunk.isResolvedWithAI = false;
-  hunk.userEdited = false;
-  refreshMergeLayout([hunk.id]);
+  if (merge.model.replaceChange(hunk, side, resolveChange)) refreshMergeLayout([hunk.id]);
 }
 
-function sideIndex(side: 'local' | 'remote') {
-  return side === 'local' ? 0 : 1;
-}
-
-function getSideLines(hunk: Hunk, side: 'local' | 'remote') {
-  return side === 'local' ? hunk.localLines : hunk.remoteLines;
-}
-
-function isSideChanged(hunk: Hunk, side: 'local' | 'remote') {
-  if (hunk.kind === 'conflict') return true;
-  if (hunk.kind !== 'auto' || !hunk.conflictType) return false;
-  return side === 'local' ? hunk.conflictType.leftChange : hunk.conflictType.rightChange;
-}
-
-function handleAutoApplyClick(hunk: Hunk, side: 'local' | 'remote') {
+function handleAutoApplyClick(hunk: MergeChange, side: 'local' | 'remote') {
   if (!merge || hunk.kind !== 'auto' || !isSideChanged(hunk, side)) return;
   syncResultEditsFromTracker();
-  const resolved = hunk.resolved ?? [false, false];
-  if (resolved[0] && resolved[1]) return;
-  hunk.resolvedLines = getSideLines(hunk, side).slice();
-  hunk.resolved = [true, true];
-  hunk.isOnesideAppliedConflict = false;
-  hunk.status = side === 'local' ? 'accepted-local' : 'accepted-remote';
-  hunk.lastAppliedSnapshot = hunk.resolvedLines.slice();
-  hunk.isResolvedWithAI = false;
-  hunk.userEdited = false;
-  refreshMergeLayout([hunk.id]);
+  if (merge.model.replaceChange(hunk, side)) refreshMergeLayout([hunk.id]);
 }
 
-function handleIgnoreClick(hunk: Hunk, side: 'local' | 'remote', resolveChange: boolean = false) {
+function handleIgnoreClick(hunk: MergeChange, side: 'local' | 'remote', resolveChange: boolean = false) {
   if (!merge) return;
   syncResultEditsFromTracker();
-  if (!hunk.resolved) hunk.resolved = [false, false];
-  const sideIdx = sideIndex(side);
-  if (hunk.resolved[sideIdx] && !resolveChange) return;
-
-  if (hunk.kind !== 'conflict') {
-    hunk.resolved = [true, true];
-    hunk.status = 'manual';
-  } else {
-    const previousStatus = hunk.status;
-    hunk.resolved[sideIdx] = true;
-    if (resolveChange) hunk.resolved = [true, true];
-
-    if (hunk.resolved[0] && hunk.resolved[1]) {
-      hunk.status = previousStatus === 'pending' ? 'manual' : previousStatus;
-      hunk.isOnesideAppliedConflict = false;
-    } else {
-      hunk.status = 'pending';
-      hunk.isOnesideAppliedConflict = false;
-    }
-  }
-
-  hunk.lastAppliedSnapshot = hunk.resolvedLines.slice();
-  refreshMergeLayout([hunk.id]);
+  if (merge.model.ignoreChange(hunk, side, resolveChange)) refreshMergeLayout([hunk.id]);
 }
 
-function isChangeRangeModified(hunk: Hunk): boolean {
-  return !linesEqualArr(hunk.resolvedLines, hunk.baseLines);
+function resolveChangeAutomatically(hunk: MergeChange, side: 'local' | 'remote' | 'base'): boolean {
+  return merge?.model.resolveChangeAutomatically(hunk, side) ?? false;
 }
 
-function canResolveChangeAutomatically(hunk: Hunk, side: 'local' | 'remote' | 'base'): boolean {
-  if (hunk.kind === 'conflict') {
-    return side === 'base'
-      && hunk.conflictType?.resolutionStrategy !== null
-      && hunk.conflictType?.resolutionStrategy !== undefined
-      && !(hunk.resolved?.[0] ?? false)
-      && !(hunk.resolved?.[1] ?? false)
-      && (hunk.conflictType.resolutionStrategy !== 'TEXT' || !isChangeRangeModified(hunk));
-  }
-
-  const effectiveSide = side === 'base' ? 'local' : side;
-  return hunk.kind === 'auto'
-    && !isResolved(hunk)
-    && isSideChanged(hunk, effectiveSide)
-    && !isChangeRangeModified(hunk);
-}
-
-function resolveChangeAutomatically(hunk: Hunk, side: 'local' | 'remote' | 'base'): boolean {
-  if (!canResolveChangeAutomatically(hunk, side)) return false;
-
-  if (hunk.kind === 'conflict') {
-    if (hunk.conflictType?.resolutionStrategy === 'SEMANTIC') return false;
-    const merged = tryResolveConflict(hunk.localLines, hunk.baseLines, hunk.remoteLines);
-    if (!merged) return false;
-    hunk.resolvedLines = merged;
-    hunk.status = 'accepted-both';
-  } else {
-    const effectiveSide = side === 'base'
-      ? (isSideChanged(hunk, 'local') ? 'local' : 'remote')
-      : side;
-    hunk.resolvedLines = getSideLines(hunk, effectiveSide).slice();
-    hunk.status = effectiveSide === 'local' ? 'accepted-local' : 'accepted-remote';
-  }
-
-  hunk.resolved = [true, true];
-  hunk.isOnesideAppliedConflict = false;
-  hunk.isResolvedWithAI = false;
-  hunk.lastAppliedSnapshot = hunk.resolvedLines.slice();
-  hunk.userEdited = false;
-  return true;
-}
-
-function resetResolvedChange(hunk: Hunk, force = false): boolean {
+function resetResolvedChange(hunk: MergeChange, force = false): boolean {
+  if (!merge) return false;
   syncResultEditsFromTracker();
-  if (!resetResolvedChangeState(hunk, force)) return false;
+  if (!merge.model.resetResolvedChange(hunk, force)) return false;
   refreshMergeLayout([hunk.id]);
   return true;
+}
+
+// IDEA's ApplySelectedChangesAction / IgnoreSelectedChangesAction (design.md §9):
+// operate on every change hunk whose pane range overlaps the editor selection
+// (a collapsed selection = the cursor line, so this also covers the common
+// "right-click on a change" case). Hunk ids are captured up front because each
+// apply re-aligns the layout.
+function selectedLineRange(editor: monaco.editor.IStandaloneCodeEditor): { start: number; end: number } | null {
+  const sel = editor.getSelection();
+  if (!sel) return null;
+  return {
+    start: Math.min(sel.startLineNumber, sel.endLineNumber),
+    end: Math.max(sel.startLineNumber, sel.endLineNumber)
+  };
+}
+
+function hunkOverlapsSelection(hunkId: number, pane: 'local' | 'result' | 'remote', sel: { start: number; end: number }): boolean {
+  const r = getTrackedRanges(hunkId)[pane];
+  const rStart = r.start;
+  const rEnd = r.start + Math.max(r.length, 1) - 1;
+  return rStart <= sel.end && sel.start <= rEnd;
+}
+
+function hunksInSideSelection(editor: monaco.editor.IStandaloneCodeEditor, side: 'local' | 'remote'): MergeChange[] {
+  if (!merge) return [];
+  const sel = selectedLineRange(editor);
+  if (!sel) return [];
+  return merge.hunks.filter((h) =>
+    (h.kind === 'conflict' || (h.kind === 'auto' && isSideChanged(h, side)))
+    && !isResolved(h)
+    && hunkOverlapsSelection(h.id, side, sel)
+  );
+}
+
+function hunksInResultSelection(): MergeChange[] {
+  if (!merge) return [];
+  const sel = selectedLineRange(merge.result.editor);
+  if (!sel) return [];
+  return merge.hunks.filter((h) =>
+    (h.kind === 'conflict' || h.kind === 'auto')
+    && !isResolved(h)
+    && hunkOverlapsSelection(h.id, 'result', sel)
+  );
+}
+
+function applySelectedSideChanges(editor: monaco.editor.IStandaloneCodeEditor, side: 'local' | 'remote'): void {
+  const ids = hunksInSideSelection(editor, side).map((h) => h.id);
+  if (!ids.length) return;
+  executeMergeCommand(side === 'local' ? 'Apply Selected Local Changes' : 'Apply Selected Remote Changes', () => {
+    for (const id of ids) {
+      const h = merge?.hunks.find((x) => x.id === id);
+      if (!h || isResolved(h)) continue;
+      if (h.kind === 'conflict') handleConflictClick(h, side);
+      else handleAutoApplyClick(h, side);
+    }
+  });
+}
+
+function ignoreSelectedSideChanges(editor: monaco.editor.IStandaloneCodeEditor, side: 'local' | 'remote'): void {
+  const ids = hunksInSideSelection(editor, side).map((h) => h.id);
+  if (!ids.length) return;
+  executeMergeCommand(side === 'local' ? 'Ignore Selected Local Changes' : 'Ignore Selected Remote Changes', () => {
+    for (const id of ids) {
+      const h = merge?.hunks.find((x) => x.id === id);
+      if (h) handleIgnoreClick(h, side);
+    }
+  });
+}
+
+function ignoreSelectedResultChanges(): void {
+  const ids = hunksInResultSelection().map((h) => h.id);
+  if (!ids.length) return;
+  executeMergeCommand('Ignore Selected Changes', () => {
+    for (const id of ids) {
+      const h = merge?.hunks.find((x) => x.id === id);
+      if (h) handleIgnoreClick(h, 'local', true); // resolveChange=true → ignore the whole hunk
+    }
+  });
+}
+
+function magicResolveSelectedConflicts(): void {
+  const ids = hunksInResultSelection()
+    .filter((h) => h.kind === 'conflict' && h.status === 'pending')
+    .map((h) => h.id);
+  if (!ids.length) return;
+  executeMergeCommand('Magic Resolve Selected Conflicts', () => {
+    syncResultEditsFromTracker();
+    const changed: number[] = [];
+    for (const id of ids) {
+      const h = merge?.hunks.find((x) => x.id === id);
+      if (h && h.kind === 'conflict' && h.status === 'pending' && resolveChangeAutomatically(h, 'base')) changed.push(h.id);
+    }
+    if (changed.length) refreshMergeLayout(changed);
+  });
 }
 
 // IDEA semantics:
-//   Apply All Non-Conflicting → same as Apply Non-Conflicts From Left
+//   Apply All Non-Conflicting -> same as Apply Non-Conflicts From Left
 //     (IDEA's BASE toolbar action uses masterSide=LEFT).
-//   Apply Left Non-Conflicting → for auto hunks where local changed vs base, use localLines;
+//   Apply Left Non-Conflicting -> for auto hunks where local changed vs base, use localLines;
 //     hunks that are remote-only changes are left as-is.
-//   Apply Right Non-Conflicting → mirror of left.
+//   Apply Right Non-Conflicting -> mirror of left.
 function applyNonConflicting(side: 'local' | 'remote' | 'both') {
   if (!merge) return;
-  const effectiveSide = side === 'both' ? 'local' : side;
-  // Capture user edits first so we can skip user-edited hunks per
-  // IDEA's canResolveChangeAutomatically (design.md §6.3).
   syncResultEditsFromTracker();
-  let changed = false;
-  const changedHunks: number[] = [];
-  for (const h of merge.hunks) {
-    if (h.kind !== 'auto') continue;
-    if (!h.conflictType) continue;
-    if ((h.resolved?.[0] ?? false) && (h.resolved?.[1] ?? false)) continue;
-    if (isChangeRangeModified(h)) continue;
-    // IDEA semantics (design.md §6.2): for "Apply Non-Conflicts From Left",
-    // pick masterSide=LEFT only when the hunk has a leftChange. Composite auto
-    // hunks (built by buildThreeWayHunksByLine) lack a single conflictType
-    // — fall back to a per-line content compare against base.
-    const ct = h.conflictType;
-    const sideChanged = effectiveSide === 'local' ? ct.leftChange : ct.rightChange;
-    if (!sideChanged) continue;
-    if (resolveChangeAutomatically(h, effectiveSide)) {
-      changed = true;
-      changedHunks.push(h.id);
-    }
-  }
-  if (changed) refreshMergeLayout(changedHunks);
+  const result = merge.model.applyNonConflicting(side);
+  if (result.changed) refreshMergeLayout(result.changedHunkIds);
 }
-
-const IMPORT_LINE = /^\s*(?:import\b|from\s+\S+\s+import\b|#include\b|using\s+\w+\b|require\s*\()/;
-const stripWS = (s: string) => s.replace(/\s+/g, '');
 
 function runMagicResolve() {
   if (!merge) return;
   syncResultEditsFromTracker();
-  let resolved = 0;
-  const changedHunks: number[] = [];
-  for (const h of merge.hunks) {
-    if (h.kind !== 'conflict' || h.status !== 'pending') continue;
-    if (isChangeRangeModified(h)) continue;
-    // Whitespace-only difference → keep local
-    const an = h.localLines.map(stripWS).filter((l) => l.length > 0);
-    const bn = h.remoteLines.map(stripWS).filter((l) => l.length > 0);
-    if (an.length === bn.length && an.every((v, i) => v === bn[i])) {
-      h.resolvedLines = h.localLines.slice();
-      h.status = 'accepted-local';
-      h.resolved = [true, true];
-      h.isOnesideAppliedConflict = false;
-      h.isResolvedWithAI = false;
-      h.lastAppliedSnapshot = h.resolvedLines.slice();
-      h.userEdited = false;
-      resolved++;
-      changedHunks.push(h.id);
-      continue;
-    }
-    // Pure import-block conflict → sorted union
-    const allImport = (lines: string[]) => {
-      const m = lines.filter((l) => l.trim().length > 0);
-      return m.length > 0 && m.every((l) => IMPORT_LINE.test(l));
-    };
-    if (allImport(h.localLines) && allImport(h.remoteLines)) {
-      h.resolvedLines = Array.from(new Set([...h.localLines, ...h.remoteLines]))
-        .filter((l) => l.trim().length > 0)
-        .sort();
-      h.status = 'accepted-both';
-      h.resolved = [true, true];
-      h.isOnesideAppliedConflict = false;
-      h.lastAppliedSnapshot = h.resolvedLines.slice();
-      h.userEdited = false;
-      resolved++;
-      changedHunks.push(h.id);
-      continue;
-    }
-    if (resolveChangeAutomatically(h, 'base')) {
-      resolved++;
-      changedHunks.push(h.id);
-    }
-  }
-  if (resolved > 0) refreshMergeLayout(changedHunks);
+  const changedHunks = magicResolve(merge.hunks);
+  if (changedHunks.length > 0) refreshMergeLayout(changedHunks);
 }
 
 // MergeModelBase equivalent: keep each hunk's BASE/result block range live via
@@ -627,7 +619,7 @@ function syncResultEditsFromTracker() {
     const block = merge.resultTracker.readLines(h.id);
     const expected = buildPaneBlock(h, 'result', range.length);
     if (linesEqualArr(block, expected)) continue;
-    // user edited inside this hunk — strip trailing pad-empties beyond original content
+    // user edited inside this hunk 鈥?strip trailing pad-empties beyond original content
     let last = block.length;
     while (last > h.resolvedLines.length && block[last - 1] === '') last--;
     h.userEdited = true;
@@ -635,15 +627,9 @@ function syncResultEditsFromTracker() {
   }
 }
 
-function linesEqualArr(a: string[], b: string[]) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
 function refreshMergeLayout(changedResultHunks?: readonly number[]) {
   if (!merge) return;
-  // Preserve result-pane cursor + scroll across programmatic updates — without this,
+  // Preserve result-pane cursor + scroll across programmatic updates 鈥?without this,
   // every Apply / Ignore / Magic click jumps the user back to (1,1).
   const savedPos = merge.result.editor.getPosition();
   const savedScrollTop = merge.result.editor.getScrollTop();
@@ -690,6 +676,7 @@ function refreshMergeLayout(changedResultHunks?: readonly number[]) {
     merge.localTracker.reset(extractPaneRanges(built.ranges, 'local'));
     merge.resultTracker.reset(extractPaneRanges(built.ranges, 'result'));
     merge.remoteTracker.reset(extractPaneRanges(built.ranges, 'remote'));
+    syncResultRangesIntoHunks();
     if (savedPos) {
       const lineCount = resultModel.getLineCount();
       const targetLine = Math.min(savedPos.lineNumber, lineCount);
@@ -736,12 +723,13 @@ function navigateMerge(dir: 1 | -1) {
     merge.result.editor.focus();
     return;
   }
-  // No more conflicts in this direction → cross to next/prev conflicted file.
+  // No more conflicts in this direction: cross to next/prev conflicted file.
   requestSwitchFile(dir);
 }
 
 function syncScroll(source: monaco.editor.IStandaloneCodeEditor, others: monaco.editor.IStandaloneCodeEditor[]) {
   source.onDidScrollChange((e) => {
+    if (!autoScrollEnabled) return;
     if (suppressScroll) return;
     suppressScroll = true;
     for (const o of others) o.setScrollTop(e.scrollTop);
@@ -754,14 +742,14 @@ function syncIgnoreWSSelect(value: string) {
   if (sel) sel.value = value;
 }
 
-function captureAutoResolved(hunks: Hunk[]) {
+function captureAutoResolved(hunks: MergeChange[]) {
   autoResolved = new Map();
   for (const h of hunks) {
     if (h.kind === 'auto') autoResolved.set(h.id, (h.autoResolvedLines ?? h.resolvedLines).slice());
   }
 }
 
-function applyAutoMergedNonConflictsTo(hunks: Hunk[]) {
+function applyAutoMergedNonConflictsTo(hunks: MergeChange[]) {
   let changed = false;
   for (const h of hunks) {
     if (h.kind !== 'auto') continue;
@@ -782,82 +770,126 @@ function setModifierShift(value: boolean) {
   decorateMerge();
 }
 
+function autoResolveImportChangesTo(hunks: MergeChange[]) {
+  let changed = false;
+  const model = new MergeConflictModel(hunks);
+  for (const h of hunks) {
+    if (!h.isImportChange || isResolved(h)) continue;
+    if (!isImportBlock(h.localLines) && !isImportBlock(h.remoteLines)) continue;
+    model.replaceWithNewContent(h, mergeImportBlocks(h.localLines, h.baseLines, h.remoteLines), 'accepted-both');
+    model.markChangeResolved(h);
+    changed = true;
+  }
+  return changed;
+}
+
+function syncResultRangesIntoHunks(): void {
+  if (!merge) return;
+  for (const hunk of merge.hunks) {
+    hunk.resultRange = getTrackedRanges(hunk.id).result;
+  }
+}
+
+function currentHunkForPane(pane: MergeActionPane): MergeChange | undefined {
+  if (pane === 'result') return currentResultChangeHunk();
+  return currentSideChangeHunk(pane);
+}
+
+function selectedHunkIdsForPane(pane: MergeActionPane): number[] {
+  if (!merge) return [];
+  if (pane === 'result') return hunksInResultSelection().map((h) => h.id);
+  const editor = pane === 'local' ? merge.local.editor : merge.remote.editor;
+  return hunksInSideSelection(editor, pane).map((h) => h.id);
+}
+
+function runAdditionalMergeAction(action: MergeAdditionalActionDescriptor, pane: MergeActionPane): void {
+  if (!merge) return;
+  vscode.postMessage({
+    type: 'runAdditionalMergeAction',
+    actionId: action.id,
+    pane,
+    filePath: merge.filePath,
+    language: merge.language,
+    ignoreWS: merge.ignoreWS,
+    selectedHunkIds: selectedHunkIdsForPane(pane),
+    currentHunkId: currentHunkForPane(pane)?.id
+  });
+}
+
 function registerMergeContextActions(
   local: monaco.editor.IStandaloneCodeEditor,
   result: monaco.editor.IStandaloneCodeEditor,
-  remote: monaco.editor.IStandaloneCodeEditor
+  remote: monaco.editor.IStandaloneCodeEditor,
+  additionalActions: readonly MergeAdditionalActionDescriptor[] = []
 ): void {
   local.addAction({
-    id: 'git-diff-fast.apply-local-change',
-    label: 'Apply Local Change',
+    id: 'git-diff-fast.apply-local-changes',
+    label: 'Apply Local Change(s)',
     contextMenuGroupId: '1_modification',
     contextMenuOrder: 1,
-    run: () => {
-      const h = currentSideChangeHunk('local');
-      if (!h) return;
-      executeMergeCommand('Apply Left Change', () => {
-        if (h.kind === 'conflict') handleConflictClick(h, 'local');
-        else handleAutoApplyClick(h, 'local');
-      });
-    }
+    run: () => applySelectedSideChanges(local, 'local')
   });
   local.addAction({
-    id: 'git-diff-fast.ignore-local-change',
-    label: 'Ignore Local Change',
+    id: 'git-diff-fast.ignore-local-changes',
+    label: 'Ignore Local Change(s)',
     contextMenuGroupId: '1_modification',
     contextMenuOrder: 2,
-    run: () => {
-      const h = currentSideChangeHunk('local');
-      if (h) executeMergeCommand('Ignore Left Change', () => handleIgnoreClick(h, 'local'));
-    }
+    run: () => ignoreSelectedSideChanges(local, 'local')
   });
   remote.addAction({
-    id: 'git-diff-fast.apply-remote-change',
-    label: 'Apply Remote Change',
+    id: 'git-diff-fast.apply-remote-changes',
+    label: 'Apply Remote Change(s)',
     contextMenuGroupId: '1_modification',
     contextMenuOrder: 1,
-    run: () => {
-      const h = currentSideChangeHunk('remote');
-      if (!h) return;
-      executeMergeCommand('Apply Right Change', () => {
-        if (h.kind === 'conflict') handleConflictClick(h, 'remote');
-        else handleAutoApplyClick(h, 'remote');
-      });
-    }
+    run: () => applySelectedSideChanges(remote, 'remote')
   });
   remote.addAction({
-    id: 'git-diff-fast.ignore-remote-change',
-    label: 'Ignore Remote Change',
+    id: 'git-diff-fast.ignore-remote-changes',
+    label: 'Ignore Remote Change(s)',
     contextMenuGroupId: '1_modification',
     contextMenuOrder: 2,
-    run: () => {
-      const h = currentSideChangeHunk('remote');
-      if (h) executeMergeCommand('Ignore Right Change', () => handleIgnoreClick(h, 'remote'));
-    }
+    run: () => ignoreSelectedSideChanges(remote, 'remote')
   });
   result.addAction({
-    id: 'git-diff-fast.magic-resolve-change',
-    label: 'Magic Resolve Change',
+    id: 'git-diff-fast.magic-resolve-changes',
+    label: 'Magic Resolve Conflict(s)',
     contextMenuGroupId: '1_modification',
     contextMenuOrder: 1,
-    run: () => {
-      const h = currentResultChangeHunk();
-      if (h) executeMergeCommand('Magic Resolve Change', () => {
-        syncResultEditsFromTracker();
-        if (resolveChangeAutomatically(h, 'base')) refreshMergeLayout([h.id]);
-      });
-    }
+    run: () => magicResolveSelectedConflicts()
+  });
+  result.addAction({
+    id: 'git-diff-fast.ignore-changes',
+    label: 'Ignore Change(s)',
+    contextMenuGroupId: '1_modification',
+    contextMenuOrder: 2,
+    run: () => ignoreSelectedResultChanges()
   });
   result.addAction({
     id: 'git-diff-fast.reset-change',
     label: 'Reset Change to Base',
     contextMenuGroupId: '1_modification',
-    contextMenuOrder: 2,
+    contextMenuOrder: 3,
     run: () => {
       const h = currentResultChangeHunk();
       if (h) executeMergeCommand('Reset Change', () => resetResolvedChange(h, true));
     }
   });
+
+  for (const action of additionalActions) {
+    const panes = action.pane === 'all' || !action.pane
+      ? (['local', 'result', 'remote'] as MergeActionPane[])
+      : [action.pane];
+    for (const pane of panes) {
+      const editor = pane === 'local' ? local : pane === 'result' ? result : remote;
+      editor.addAction({
+        id: `git-diff-fast.additional.${action.id}.${pane}`,
+        label: action.label,
+        contextMenuGroupId: action.contextMenuGroupId ?? '2_additional',
+        contextMenuOrder: action.contextMenuOrder ?? 1,
+        run: () => runAdditionalMergeAction(action, pane)
+      });
+    }
+  }
 }
 
 export function initMerge(msg: InitMergeMessage) {
@@ -867,16 +899,24 @@ export function initMerge(msg: InitMergeMessage) {
   if (merge) {
     captureAutoResolved(msg.hunks);
     if (msg.autoApplyNonConflicts) applyAutoMergedNonConflictsTo(msg.hunks);
+    if (msg.autoResolveImports) autoResolveImportChangesTo(msg.hunks);
     merge.hunks = msg.hunks;
     merge.model = new MergeConflictModel(msg.hunks);
     merge.filePath = msg.filePath;
     merge.language = msg.language;
+    merge.localText = msg.local;
+    merge.baseText = msg.base;
+    merge.remoteText = msg.remote;
     merge.files = msg.files;
     merge.fileIndex = msg.fileIndex;
+    merge.ignoreWS = msg.ignoreWS;
+    merge.additionalActions = msg.additionalActions;
+    autoScrollEnabled = msg.autoScrollEnabled;
     dirty = false;
     prevPendingCount = -1; // reset so the "all resolved" toast fires correctly per file
     setText('title', formatTitle(msg));
     syncIgnoreWSSelect(msg.ignoreWS);
+    updateAutoScrollToggle();
     refreshMergeLayout();
     resetMergeHistory();
     return;
@@ -884,11 +924,12 @@ export function initMerge(msg: InitMergeMessage) {
 
   captureAutoResolved(msg.hunks);
   if (msg.autoApplyNonConflicts) applyAutoMergedNonConflictsTo(msg.hunks);
+  if (msg.autoResolveImports) autoResolveImportChangesTo(msg.hunks);
   const built = buildAlignedThree(msg.hunks);
   const local = makeEditor(byId('local'), built.local, msg.language, true);
   const result = makeEditor(byId('result'), built.result, msg.language, false);
   const remote = makeEditor(byId('remote'), built.remote, msg.language, true);
-  registerMergeContextActions(local, result, remote);
+  registerMergeContextActions(local, result, remote, msg.additionalActions);
   const localTracker = new MergeLineTracker(local);
   const resultTracker = new MergeLineTracker(result);
   const remoteTracker = new MergeLineTracker(remote);
@@ -902,12 +943,19 @@ export function initMerge(msg: InitMergeMessage) {
     resultTracker,
     remoteTracker,
     model: new MergeConflictModel(msg.hunks),
+    localText: msg.local,
+    baseText: msg.base,
+    remoteText: msg.remote,
     files: msg.files,
-    fileIndex: msg.fileIndex
+    fileIndex: msg.fileIndex,
+    ignoreWS: msg.ignoreWS,
+    additionalActions: msg.additionalActions
   };
   merge.localTracker.reset(extractPaneRanges(built.ranges, 'local'));
   merge.resultTracker.reset(extractPaneRanges(built.ranges, 'result'));
   merge.remoteTracker.reset(extractPaneRanges(built.ranges, 'remote'));
+  autoScrollEnabled = msg.autoScrollEnabled;
+  syncResultRangesIntoHunks();
   setText('title', formatTitle(msg));
   syncScroll(local, [result, remote]);
   syncScroll(result, [local, remote]);
@@ -935,7 +983,7 @@ export function initMerge(msg: InitMergeMessage) {
       else executeMergeCommand('Apply Right Change', () => handleAutoApplyClick(h, 'remote'));
     }
   });
-  // BASE column gutter click → magic-resolve a single conflict (P1-10).
+  // BASE column gutter click: magic-resolve a single conflict.
   result.onMouseDown((e) => {
     if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return;
     const line = e.target.position?.lineNumber; if (!line) return;
@@ -1020,6 +1068,11 @@ export function initMerge(msg: InitMergeMessage) {
         return;
       }
     }
+    if (e.key === 'Escape' && document.getElementById('partialDiffModal')) {
+      e.preventDefault();
+      closePartialCompare();
+      return;
+    }
     setModifierShift(e.shiftKey);
     if (e.key === 'F7' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault(); navigateMerge(1);
@@ -1048,6 +1101,23 @@ export function initMerge(msg: InitMergeMessage) {
   byId('applyR').onclick = () => executeMergeCommand('Apply Non-Conflicts From Right', () => applyNonConflicting('remote'));
   byId('applyB').onclick = () => executeMergeCommand('Apply Non-Conflicts', () => applyNonConflicting('both'));
   byId('magic').onclick = () => executeMergeCommand('Magic Resolve', () => runMagicResolve());
+  byId('compareContents').onclick = () => showCompareContents();
+  const collapseBtn = document.getElementById('collapseUnchanged') as HTMLButtonElement | null;
+  if (collapseBtn) {
+    updateCollapseToggle();
+    collapseBtn.onclick = () => {
+      collapseUnchanged = !collapseUnchanged;
+      applyCollapsedUnchangedAreas();
+    };
+  }
+  const autoScrollBtn = document.getElementById('autoScroll') as HTMLButtonElement | null;
+  if (autoScrollBtn) {
+    updateAutoScrollToggle();
+    autoScrollBtn.onclick = () => {
+      autoScrollEnabled = !autoScrollEnabled;
+      updateAutoScrollToggle();
+    };
+  }
   const granSelect = document.getElementById('mergeGranularity') as HTMLSelectElement | null;
   if (granSelect) {
     granSelect.value = mergeGranularity;
@@ -1066,6 +1136,12 @@ export function initMerge(msg: InitMergeMessage) {
         dirty
       });
     };
+    const compareModeSelect = document.getElementById('compareContentsMode') as HTMLSelectElement | null;
+    if (compareModeSelect) {
+      compareModeSelect.onchange = () => {
+        if (isPartialCompareOpen()) showCompareContents();
+      };
+    }
   }
   byId('cancel').onclick = () => {
     vscode.postMessage({ type: 'finishMerge', result: 'CANCEL', dirty });
@@ -1073,8 +1149,9 @@ export function initMerge(msg: InitMergeMessage) {
   byId('accept').onclick = () => {
     if (!merge) return;
     const content = merge.result.editor.getValue();
+    const unresolvedCount = merge.hunks.filter((h) => h.kind === 'conflict' && !isResolved(h)).length;
     dirty = false;
-    vscode.postMessage({ type: 'finishMerge', result: 'RESOLVED', outputText: content, dirty: false });
+    vscode.postMessage({ type: 'finishMerge', result: 'RESOLVED', outputText: content, dirty: false, unresolvedCount });
   };
   const acceptLeftBtn = document.getElementById('acceptLeft');
   if (acceptLeftBtn) acceptLeftBtn.onclick = () => {

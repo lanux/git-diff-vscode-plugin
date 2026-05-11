@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as path from 'path';
+import * as fs from 'fs';
 
 const pexec = promisify(execFile);
 
@@ -15,7 +16,8 @@ export async function gitBuf(cwd: string, args: string[]): Promise<Buffer> {
 }
 
 export async function getRepoRoot(fileOrDir: string): Promise<string> {
-  const cwd = path.dirname(fileOrDir);
+  const stat = await fs.promises.stat(fileOrDir).catch(() => undefined);
+  const cwd = stat?.isDirectory() ? fileOrDir : path.dirname(fileOrDir);
   const out = await git(cwd, ['rev-parse', '--show-toplevel']);
   return out.trim();
 }

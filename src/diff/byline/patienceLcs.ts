@@ -2,10 +2,24 @@ import { BitSet } from './bitSet';
 import { computeMyersLcsChanges, computeMyersLcsChangesLinear } from './myersLcs';
 import { FilesTooBigForDiffError } from './types';
 import { UniqueLCS } from './uniqueLcs';
+import type { LcsChangeComputer } from './diff';
 
 export interface LcsFallbackOptions {
     myersThreshold?: number;
     failOnSmallReduction?: boolean;
+}
+
+// Mirrors IntelliJ DiffConfig.USE_PATIENCE_ALG (default false): when true the
+// LCS step uses PatienceIntLCS directly; when false it uses Myers with a
+// Patience fallback (the current/IntelliJ-default behavior).
+export const USE_PATIENCE_ALG = false;
+
+// The LCS computer the ByLine pipeline (and the word-level resolver) should use
+// by default — matches DiffConfig.USE_PATIENCE_ALG. byline.md §3.2.
+export function defaultLcsComputer(usePatienceAlg = USE_PATIENCE_ALG): LcsChangeComputer {
+    return usePatienceAlg
+        ? (ints1, ints2) => computePatienceLcsChanges(ints1, ints2, false)
+        : computeLcsChangesWithFallback;
 }
 
 export function computeLcsChangesWithFallback(
@@ -32,7 +46,7 @@ export function computePatienceLcsChanges(
     return [changes1, changes2];
 }
 
-function executePatience(
+export function executePatience(
     first: readonly number[],
     second: readonly number[],
     start1: number,

@@ -13,14 +13,21 @@ export function toInternalPolicy(policy: ComparisonPolicy): InternalComparisonPo
     }
 }
 
+// IntelliJ's "whitespace" for ByLine policies is exactly { ' ', '\t', '\n' }
+// (byline.md §2, §9.3). A line is normally a single line (no '\n') after the
+// text→lines split, so the '\n' only matters if a raw line slips through, but we
+// keep it exact for 1:1 parity with ComparisonUtil.hashCode / isEqualTexts.
+const TRIM_RE = /^[ \t\n]+|[ \t\n]+$/g;
+const IW_RE = /[ \t\n]/g;
+
 export function normalizeForPolicy(line: string, policy: ComparisonPolicy): string {
     switch (toInternalPolicy(policy)) {
         case 'DEFAULT':
             return line;
         case 'TRIM':
-            return line.replace(/^[ \t]+|[ \t]+$/g, '');
+            return line.replace(TRIM_RE, '');
         case 'IW':
-            return line.replace(/[\s]+/g, '');
+            return line.replace(IW_RE, '');
     }
 }
 
@@ -49,5 +56,6 @@ function javaStringHash(text: string): number {
 }
 
 function isWhitespace(char: string): boolean {
-    return char === ' ' || char === '\t' || char === '\n' || char === '\r' || char === '\f';
+    // IntelliJ's nonSpaceChars counter (byline.md §2) skips exactly ' ', '\t', '\n'.
+    return char === ' ' || char === '\t' || char === '\n';
 }

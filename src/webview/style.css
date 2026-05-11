@@ -87,6 +87,11 @@ body[data-mode="compare"] #mergeRoot {
   background: var(--vscode-toolbar-hoverBackground);
 }
 
+.action-btn.active {
+  background: var(--vscode-toolbar-activeBackground);
+  color: var(--vscode-button-foreground);
+}
+
 .action-btn:active {
   background: var(--vscode-toolbar-activeBackground);
 }
@@ -232,8 +237,8 @@ body[data-mode="compare"] #mergeRoot {
 }
 
 .hunk-resolved {
-  background: rgba(98, 150, 85, 0.18);
-  border-left: 2px solid rgba(98, 150, 85, .8);
+  background: transparent;
+  box-shadow: inset 2px 0 0 rgba(98, 150, 85, .85), inset 0 1px 0 rgba(98, 150, 85, .35), inset 0 -1px 0 rgba(98, 150, 85, .35);
 }
 
 /* hunk decorations (compare) */
@@ -251,6 +256,11 @@ body[data-mode="compare"] #mergeRoot {
 
 .word-diff {
   background: rgba(70, 130, 180, 0.55);
+  border-radius: 2px;
+}
+
+.base-word-diff {
+  background: rgba(145, 127, 179, 0.45);
   border-radius: 2px;
 }
 
@@ -298,6 +308,66 @@ body[data-mode="compare"] #mergeRoot {
   color: var(--vscode-testing-iconPassed, #4ec9b0);
   font-weight: 600;
   transition: opacity .25s ease;
+}
+
+.partial-diff-modal {
+  position: absolute;
+  inset: 40px;
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .35);
+}
+
+.partial-diff-title {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 4px 0 10px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.partial-diff-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.partial-diff-title .spacer {
+  flex: 1;
+}
+
+.partial-diff-pane-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.partial-diff-pane-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.partial-diff-pane-header .spacer {
+  flex: 1;
+}
+
+.partial-diff-jump {
+  width: 22px;
+  height: 22px;
+}
+
+.partial-diff-panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
 }
 
 /* ===== compare layout ===== */

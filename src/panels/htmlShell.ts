@@ -49,6 +49,18 @@ export function renderShell(
       </div>
       <div class="actions-separator"></div>
       <div class="actions-group">
+        <select id="compareContentsMode" class="action-select" title="Compare current change contents" aria-label="Compare contents">
+          <option value="change-local-base">Change: Local ↔ Base</option>
+          <option value="change-base-remote">Change: Base ↔ Remote</option>
+          <option value="change-local-remote">Change: Local ↔ Remote</option>
+          <option value="file-local-base">File: Local ↔ Base</option>
+          <option value="file-base-remote">File: Base ↔ Remote</option>
+          <option value="file-local-remote">File: Local ↔ Remote</option>
+        </select>
+        <button id="compareContents" class="action-btn" title="Compare Contents for current change" aria-label="Compare Contents"><span class="codicon codicon-diff"></span></button>
+      </div>
+      <div class="actions-separator"></div>
+      <div class="actions-group">
         <select id="mergeIgnoreWS" class="action-select" title="Whitespace handling" aria-label="Whitespace handling">
           <option value="none">Do not ignore</option>
           <option value="trim">Trim whitespace</option>
@@ -60,6 +72,8 @@ export function renderShell(
           <option value="word">Word</option>
           <option value="line">Line</option>
         </select>
+        <button id="collapseUnchanged" class="action-btn" title="Collapse unchanged sections" aria-label="Collapse unchanged sections" aria-pressed="false"><span class="codicon codicon-fold"></span></button>
+        <button id="autoScroll" class="action-btn" title="Disable synchronized scrolling" aria-label="Toggle synchronized scrolling" aria-pressed="true"><span class="codicon codicon-link"></span></button>
       </div>
       <span id="title" class="action-label file-path-label"></span>
       <span class="spacer"></span>

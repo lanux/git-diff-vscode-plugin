@@ -1,6 +1,7 @@
 // IntelliJ ByLine public facade.
 // Current core path: policy-aware Line objects -> Diff.buildChanges
-// -> Myers threshold + Patience fallback -> FairDiffIterable
+// -> Myers threshold + Patience fallback (or patience-first when requested)
+// -> FairDiffIterable
 // -> ComparisonMergeUtil.buildSimple equivalent.
 //
 // Full IntelliJ parity still depends on keeping the surrounding merge model
@@ -11,11 +12,17 @@ import { create as createDiffIterable, fair as makeFair } from './byline/iterabl
 import { buildLines } from './byline/line';
 import { optimizeLineChunks } from './byline/lineChunkOptimizer';
 import { buildMerge, buildSimpleMerge as buildSimpleMergeImpl } from './byline/mergeUtil';
+import { USE_PATIENCE_ALG } from './byline/patienceLcs';
 import { linesEqual, toInternalPolicy } from './byline/policy';
 import { compareSmart } from './byline/smartCorrector';
 import type { ComparisonPolicy, FairDiffIterable, InternalComparisonPolicy, MergeRange, Range } from './byline/types';
 
 export type { ComparisonPolicy, FairDiffIterable, MergeRange, Range } from './byline/types';
+export { USE_PATIENCE_ALG } from './byline/patienceLcs';
+
+export interface ByLineOptions {
+  usePatienceAlg?: boolean;
+}
 
 export interface MergeLineBoundary {
   leftStart: number;
@@ -33,27 +40,30 @@ export interface MergeLineBoundary {
 export function compareLines(
   lines1: string[],
   lines2: string[],
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): FairDiffIterable {
-  return compareLines2(lines1, lines2, policy);
+  return compareLines2(lines1, lines2, policy, options);
 }
 
 export function compareLines2(
   lines1: string[],
   lines2: string[],
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): FairDiffIterable {
   const normalizedPolicy = toInternalPolicy(policy);
   const prepared1 = buildLines(lines1, normalizedPolicy);
   const prepared2 = buildLines(lines2, normalizedPolicy);
+  const usePatienceAlg = options.usePatienceAlg ?? USE_PATIENCE_ALG;
   if (normalizedPolicy === 'IW') {
-    const iterable = optimizeLineChunks(prepared1, prepared2, compareSmart(prepared1, prepared2));
+    const iterable = optimizeLineChunks(prepared1, prepared2, compareSmart(prepared1, prepared2, undefined, usePatienceAlg));
     return expandRanges(lines1, lines2, iterable, normalizedPolicy);
   }
 
   const iwLines1 = buildLines(lines1, 'IW');
   const iwLines2 = buildLines(lines2, 'IW');
-  const iwChanges = optimizeLineChunks(prepared1, prepared2, compareSmart(iwLines1, iwLines2));
+  const iwChanges = optimizeLineChunks(prepared1, prepared2, compareSmart(iwLines1, iwLines2, undefined, usePatienceAlg));
   return correctChangesSecondStep(prepared1, prepared2, iwChanges);
 }
 
@@ -74,27 +84,30 @@ export function buildSimpleMerge(it1: FairDiffIterable, it2: FairDiffIterable): 
  */
 export function mergeLines(
   left: string[], base: string[], right: string[],
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): MergeRange[] {
-  return mergeLines3(left, base, right, policy);
+  return mergeLines3(left, base, right, policy, options);
 }
 
 export function compareLines3(
   left: string[], base: string[], right: string[],
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): MergeRange[] {
-  const it1 = compareMergeSide(base, left, policy);
-  const it2 = compareMergeSide(base, right, policy);
+  const it1 = compareMergeSide(base, left, policy, options);
+  const it2 = compareMergeSide(base, right, policy, options);
   return buildSimpleMergeImpl(it1, it2);
 }
 
 export function mergeLines3(
   left: string[], base: string[], right: string[],
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): MergeRange[] {
   const normalizedPolicy = toInternalPolicy(policy);
-  const it1 = compareMergeSide(base, left, policy);
-  const it2 = compareMergeSide(base, right, policy);
+  const it1 = compareMergeSide(base, left, policy, options);
+  const it2 = compareMergeSide(base, right, policy, options);
   if (normalizedPolicy === 'DEFAULT') return buildSimpleMergeImpl(it1, it2);
   return buildMerge(it1, it2, (index1, index2, index3) =>
     linesEqual(base[index2], left[index1], 'DEFAULT') && linesEqual(base[index2], right[index3], 'DEFAULT')
@@ -106,7 +119,8 @@ export function mergeLinesWithinRange(
   base: string[],
   right: string[],
   boundary: MergeLineBoundary,
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): MergeRange[] {
   validateBoundary(left.length, boundary.leftStart, boundary.leftEnd, 'left');
   validateBoundary(base.length, boundary.baseStart, boundary.baseEnd, 'base');
@@ -116,7 +130,8 @@ export function mergeLinesWithinRange(
     left.slice(boundary.leftStart, boundary.leftEnd),
     base.slice(boundary.baseStart, boundary.baseEnd),
     right.slice(boundary.rightStart, boundary.rightEnd),
-    policy
+    policy,
+    options
   );
 
   return ranges.map((range) => ({
@@ -135,13 +150,14 @@ function validateBoundary(length: number, start: number, end: number, side: stri
   }
 }
 
-function compareMergeSide(base: string[], side: string[], policy: ComparisonPolicy): FairDiffIterable {
+function compareMergeSide(base: string[], side: string[], policy: ComparisonPolicy, options: ByLineOptions): FairDiffIterable {
   const normalizedPolicy = toInternalPolicy(policy);
   const baseLines = buildLines(base, normalizedPolicy);
   const sideLines = buildLines(side, normalizedPolicy);
   const iwBase = buildLines(base, 'IW');
   const iwSide = buildLines(side, 'IW');
-  const iwChanges = optimizeLineChunks(baseLines, sideLines, compareSmart(iwBase, iwSide));
+  const usePatienceAlg = options.usePatienceAlg ?? USE_PATIENCE_ALG;
+  const iwChanges = optimizeLineChunks(baseLines, sideLines, compareSmart(iwBase, iwSide, undefined, usePatienceAlg));
   return correctChangesSecondStep(baseLines, sideLines, iwChanges);
 }
 
@@ -175,27 +191,30 @@ export function splitTextToLines(text: string): string[] {
 export function compareText2(
   text1: string,
   text2: string,
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): FairDiffIterable {
-  return compareLines2(splitTextToLines(text1), splitTextToLines(text2), policy);
+  return compareLines2(splitTextToLines(text1), splitTextToLines(text2), policy, options);
 }
 
 export function compareText3(
   left: string,
   base: string,
   right: string,
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): MergeRange[] {
-  return compareLines3(splitTextToLines(left), splitTextToLines(base), splitTextToLines(right), policy);
+  return compareLines3(splitTextToLines(left), splitTextToLines(base), splitTextToLines(right), policy, options);
 }
 
 export function mergeText3(
   left: string,
   base: string,
   right: string,
-  policy: ComparisonPolicy = 'DEFAULT'
+  policy: ComparisonPolicy = 'DEFAULT',
+  options: ByLineOptions = {}
 ): MergeRange[] {
-  return mergeLines3(splitTextToLines(left), splitTextToLines(base), splitTextToLines(right), policy);
+  return mergeLines3(splitTextToLines(left), splitTextToLines(base), splitTextToLines(right), policy, options);
 }
 
 /**

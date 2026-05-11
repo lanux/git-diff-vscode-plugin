@@ -1,10 +1,10 @@
-import type { Hunk } from '../../types';
+import type { Hunk, LineRange, MergeChange } from '../../types';
 
-export interface LineRange { start: number; length: number; }
+export type { LineRange } from '../../types';
 
 export function joinLines(lines: string[]): string { return lines.join('\n'); }
 
-export function buildAlignedThree(hunks: Hunk[]) {
+export function buildAlignedThree(hunks: MergeChange[]) {
   const localOut: string[] = [];
   const resultOut: string[] = [];
   const remoteOut: string[] = [];

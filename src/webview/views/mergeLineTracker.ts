@@ -29,7 +29,6 @@ export class MergeLineTracker {
     const decorations = hunkIds.map((hunkId) => ({
       range: toMonacoRange(ranges.get(hunkId)!, model),
       options: {
-        description: 'git-diff-merge-line-tracker',
         stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
       }
     } satisfies monaco.editor.IModelDeltaDecoration));

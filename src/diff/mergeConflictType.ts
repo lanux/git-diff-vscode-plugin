@@ -1,6 +1,7 @@
 // Mirror of IntelliJ MergeConflictType + MergeRangeUtil.getMergeType (see byline.md / design.md).
 // Pure data — no UI deps.
 import { normalizeLine, type IgnoreWhitespace } from './whitespace';
+import type { LangSpecificMergeConflictResolver } from './langSpecificMergeConflictResolver';
 
 export type ConflictKind = 'INSERTED' | 'DELETED' | 'MODIFIED' | 'CONFLICT';
 
@@ -15,6 +16,15 @@ export interface MergeConflictType {
   rightChange: boolean;
   /** null when not auto-resolvable */
   resolutionStrategy: ResolutionStrategy;
+}
+
+export interface ConflictTypePatchable {
+  localLines: readonly string[];
+  baseLines: readonly string[];
+  remoteLines: readonly string[];
+  conflictType?: MergeConflictType;
+  autoResolvedLines?: string[];
+  semanticResolutionAvailable?: boolean;
 }
 
 export function isChange(t: MergeConflictType, side: 'local' | 'remote' | 'base'): boolean {
@@ -47,11 +57,11 @@ export function classifyFragment(
   const isBaseEmpty = baseLines.length === 0;
   const isRightEmpty = remoteLines.length === 0;
 
+  if (isLeftEmpty && isBaseEmpty && isRightEmpty) {
+    throw new Error('classifyFragment received an empty merge fragment');
+  }
+
   if (isBaseEmpty) {
-    if (isLeftEmpty && isRightEmpty) {
-      // degenerate empty fragment — not expected in practice
-      return { type: 'MODIFIED', leftChange: false, rightChange: false, resolutionStrategy: 'DEFAULT' };
-    }
     if (isLeftEmpty) {
       return { type: 'INSERTED', leftChange: false, rightChange: true, resolutionStrategy: 'DEFAULT' };
     }
@@ -105,6 +115,39 @@ export function classifyFragment(
     rightChange: true,
     resolutionStrategy: canResolve ? 'TEXT' : null
   };
+}
+
+/**
+ * Semantic resolution is a post-classification patch step in IntelliJ.
+ * TEXT wins: a resolver may only upgrade previously-unresolvable CONFLICTs.
+ */
+export function patchConflictTypes<T extends ConflictTypePatchable>(
+  fragments: readonly T[],
+  semanticResolver: LangSpecificMergeConflictResolver | null = null
+): void {
+  for (const fragment of fragments) {
+    fragment.semanticResolutionAvailable = false;
+
+    const conflictType = fragment.conflictType;
+    if (!conflictType || conflictType.type !== 'CONFLICT' || conflictType.resolutionStrategy !== null) {
+      continue;
+    }
+    if (!semanticResolver?.canResolve(fragment.localLines, fragment.baseLines, fragment.remoteLines)) {
+      continue;
+    }
+
+    const resolution = semanticResolver.resolve(fragment.localLines, fragment.baseLines, fragment.remoteLines);
+    if (!resolution) {
+      continue;
+    }
+
+    fragment.conflictType = {
+      ...conflictType,
+      resolutionStrategy: 'SEMANTIC'
+    };
+    fragment.autoResolvedLines = resolution.lines.slice();
+    fragment.semanticResolutionAvailable = true;
+  }
 }
 
 function linesEqual(a: string[], b: string[], policy: IgnoreWhitespace): boolean {

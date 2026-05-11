@@ -1,5 +1,5 @@
-import { Hunk } from '../types';
-import { splitLines } from './threeWay';
+import type { CompareHunk } from '../types';
+import { splitTextToLines } from './byline';
 import { IgnoreWhitespace, normalizeLine } from './whitespace';
 
 /** Myers-style line diff producing aligned hunks (equal/modified/added/deleted). */
@@ -7,12 +7,12 @@ export function buildTwoWayHunks(
   currentText: string,
   targetText: string,
   ignoreWS: IgnoreWhitespace = 'none'
-): Hunk[] {
-  const a = splitLines(currentText);
-  const b = splitLines(targetText);
+): CompareHunk[] {
+  const a = splitTextToLines(currentText);
+  const b = splitTextToLines(targetText);
   const ops = diffLines(a, b, ignoreWS);
 
-  const hunks: Hunk[] = [];
+  const hunks: CompareHunk[] = [];
   let id = 0;
   let i = 0;
   while (i < ops.length) {
@@ -33,10 +33,10 @@ export function buildTwoWayHunks(
         else if (ops[i].kind === 'add') remoteLines.push(ops[i].value);
         i++;
       }
-      const kind: Hunk['kind'] =
+      const kind: CompareHunk['kind'] =
         localLines.length && remoteLines.length ? 'modified'
-        : localLines.length ? 'deleted'
-        : 'added';
+          : localLines.length ? 'deleted'
+            : 'added';
       hunks.push({
         id: id++, kind,
         localLines, baseLines: [], remoteLines,

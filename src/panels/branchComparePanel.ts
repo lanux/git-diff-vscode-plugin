@@ -9,6 +9,7 @@ import { listRefs, currentBranchName } from '../git/branches';
 import { diffNameStatus, diffNumStat, relScope } from '../git/nameStatus';
 import { showAtRef } from '../git/show';
 import { buildTwoWayHunks } from '../diff/twoWay';
+import { CompareScmProvider } from './compareScm';
 import type { IgnoreWhitespace } from '../diff/whitespace';
 import type { ExtToWebview, FileChange, WebviewToExt } from '../types';
 
@@ -20,8 +21,10 @@ export class BranchComparePanel {
   private constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly panel: vscode.WebviewPanel,
+    private readonly compareScm: CompareScmProvider,
     private readonly repoRoot: string,
     private readonly scopeRel: string,
+    private readonly scopeLabel: string,
     private target: string,
     private current: string,
     private reversed = false
@@ -29,12 +32,14 @@ export class BranchComparePanel {
     panel.webview.onDidReceiveMessage((msg: WebviewToExt) => this.handle(msg));
   }
 
-  static async open(context: vscode.ExtensionContext, scopeUri: vscode.Uri) {
+  static async open(context: vscode.ExtensionContext, scopeUri: vscode.Uri, compareScm: CompareScmProvider) {
     const repoRoot = await getRepoRoot(scopeUri.fsPath);
+    const scopeRel = relScope(repoRoot, scopeUri.fsPath);
+    const scopeStat = await fs.promises.stat(scopeUri.fsPath).catch(() => undefined);
+    const scopeLabel = describeScope(repoRoot, scopeRel, scopeUri.fsPath, scopeStat?.isDirectory() ?? false);
     const target = await pickBranch(context, repoRoot);
     if (!target) return;
 
-    const scopeRel = relScope(repoRoot, scopeUri.fsPath);
     const current = await currentBranchName(repoRoot);
     const [files, numstat] = await Promise.all([
       diffNameStatus(repoRoot, target, scopeRel),
@@ -51,7 +56,7 @@ export class BranchComparePanel {
 
     const panel = vscode.window.createWebviewPanel(
       'gitCompare',
-      `Compare: ${path.basename(scopeUri.fsPath) || repoRoot} ⇄ ${target}`,
+      `Compare ${scopeLabel}: ${target}`,
       vscode.ViewColumn.Active,
       {
         enableScripts: true,
@@ -61,18 +66,21 @@ export class BranchComparePanel {
     );
     panel.webview.html = renderShell(panel.webview, context.extensionUri);
 
-    const inst = new BranchComparePanel(context, panel, repoRoot, scopeRel, target, current);
+    const inst = new BranchComparePanel(context, panel, compareScm, repoRoot, scopeRel, scopeLabel, target, current);
     inst.files = files;
+    panel.onDidDispose(() => compareScm.clear(inst));
 
     await waitForReady(panel);
 
     const init: ExtToWebview = {
       type: 'init', view: 'compare',
       rootPath: scopeUri.fsPath,
+      scopeLabel,
       current, target,
       files
     };
     panel.webview.postMessage(init);
+    inst.syncCompareScm();
     return inst;
   }
 
@@ -154,8 +162,10 @@ export class BranchComparePanel {
     this.panel.webview.postMessage({
       type: 'init', view: 'compare',
       rootPath: path.join(this.repoRoot, this.scopeRel === '.' ? '' : this.scopeRel),
+      scopeLabel: this.scopeLabel,
       current: this.current, target: this.target, files
     } as ExtToWebview);
+    this.syncCompareScm();
   }
 
   private async reverse() {
@@ -163,6 +173,33 @@ export class BranchComparePanel {
     [this.current, this.target] = [this.target, this.current];
     await this.refresh();
   }
+
+  private syncCompareScm() {
+    this.compareScm.update(this, {
+      repoRoot: this.repoRoot,
+      scopeLabel: this.scopeLabel,
+      current: this.current,
+      target: this.target,
+      files: this.files,
+      onSelect: (filePath) => this.selectFromScm(filePath)
+    });
+  }
+
+  private selectFromScm(filePath: string) {
+    if (!this.files.some((file) => file.path === filePath)) return;
+    this.panel.reveal(vscode.ViewColumn.Active, true);
+    this.panel.webview.postMessage({
+      type: 'selectCompareFile',
+      path: filePath
+    } as ExtToWebview);
+  }
+}
+
+function describeScope(repoRoot: string, scopeRel: string, fsPath: string, isDirectory: boolean): string {
+  if (scopeRel === '.') {
+    return `Project ${path.basename(repoRoot) || repoRoot}`;
+  }
+  return `${isDirectory ? 'Folder' : 'File'} ${scopeRel || path.basename(fsPath)}`;
 }
 
 async function pickBranch(context: vscode.ExtensionContext, repoRoot: string): Promise<string | undefined> {

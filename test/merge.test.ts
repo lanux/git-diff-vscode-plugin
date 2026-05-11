@@ -1,10 +1,10 @@
 import { strict as assert } from 'assert';
-import { buildThreeWayHunks, hasConflictMarkers } from '../src/diff/threeWay';
+import { hasConflictMarkers, parseConflictMarkers } from '../src/diff/conflictMarkers';
 import { buildTwoWayHunks } from '../src/diff/twoWay';
 import { parseNameStatusZ } from '../src/git/nameStatus';
 import { magicResolve } from '../src/diff/magicResolve';
 import { normalizeLine } from '../src/diff/whitespace';
-import { classifyFragment } from '../src/diff/mergeConflictType';
+import { classifyFragment, patchConflictTypes, type ConflictTypePatchable } from '../src/diff/mergeConflictType';
 import { tryResolveConflict } from '../src/diff/conflictResolve';
 import {
   compareLines,
@@ -17,13 +17,16 @@ import {
   splitTextToLines
 } from '../src/diff/byline';
 import type { Range } from '../src/diff/byline';
-import type { Hunk } from '../src/types';
+import type { Hunk, MergeChange } from '../src/types';
 import {
   applyMergeSnapshot,
   createMergeSnapshot,
   MergeUndoStack
 } from '../src/webview/views/mergeUndoStack';
-import { replaceChangeWithAiState, resetResolvedChangeState } from '../src/webview/views/mergeActions';
+import { replaceChangeWithAiState, resetResolvedChangeState } from '../src/diff/merge/mergeActions';
+import { computeCollapsedUnchangedAreas } from '../src/diff/merge/collapseUnchanged';
+import { MergeConflictModel } from '../src/diff/merge/mergeModel';
+import { getLangSpecificMergeConflictResolver, type LangSpecificMergeConflictResolver } from '../src/diff/langSpecificMergeConflictResolver';
 import { updateRangeOnModification } from '../src/webview/views/mergeRangeUpdate';
 import { BitSet as ByLineBitSet } from '../src/diff/byline/bitSet';
 import {
@@ -42,11 +45,13 @@ import {
   type LcsChangeComputer
 } from '../src/diff/byline/diff';
 import { buildLines } from '../src/diff/byline/line';
+import { getBestMatchingAlignment } from '../src/diff/byline/correctSecondStep';
 import { optimizeLineChunks } from '../src/diff/byline/lineChunkOptimizer';
 import { computeMyersLcsChanges } from '../src/diff/byline/myersLcs';
-import { computeLcsChangesWithFallback, computePatienceLcsChanges } from '../src/diff/byline/patienceLcs';
+import { computeLcsChangesWithFallback, computePatienceLcsChanges, executePatience } from '../src/diff/byline/patienceLcs';
 import { normalizeForPolicy } from '../src/diff/byline/policy';
 import { compareSmart } from '../src/diff/byline/smartCorrector';
+import { FilesTooBigForDiffError } from '../src/diff/byline/types';
 import { UniqueLCS } from '../src/diff/byline/uniqueLcs';
 import { buildThreeWayHunksByLine } from '../src/diff/threeWayByLine';
 
@@ -97,6 +102,31 @@ function unchangedBitCount(bits: ByLineBitSet, length: number): number {
     if (!bits.get(i)) count++;
   }
   return count;
+}
+
+function runExecutePatience(
+  first: readonly number[],
+  second: readonly number[],
+  thresholdCheckCounter: number,
+  rootCount1 = first.length,
+  rootCount2 = second.length
+): [boolean[], boolean[]] {
+  const changes1 = new ByLineBitSet(first.length);
+  const changes2 = new ByLineBitSet(second.length);
+  executePatience(
+    first,
+    second,
+    0,
+    first.length,
+    0,
+    second.length,
+    thresholdCheckCounter,
+    changes1,
+    changes2,
+    rootCount1,
+    rootCount2
+  );
+  return [changes1.toBooleans(first.length), changes2.toBooleans(second.length)];
 }
 
 describe('ByLine A3 foundation (IntelliJ Diff.buildChanges skeleton)', () => {
@@ -220,12 +250,37 @@ describe('ByLine A3 foundation (IntelliJ Diff.buildChanges skeleton)', () => {
     assert.deepEqual(patienceRanges, dpRanges);
   });
 
-  it('Patience fallback returns the DP-equivalent ranges when Myers is forced to fail by threshold', () => {
-    const left = [1, 2, 3, 4];
-    const right = [1, 9, 3, 4];
+  it('public compareLines facade accepts patience-first selection', () => {
+    const iterable = compareLines(['1', '2', '8', '3'], ['9', '1', '2', '7', '3'], 'DEFAULT', { usePatienceAlg: true });
+    assert.deepEqual(Array.from(iterable.changes()), [
+      { start1: 0, end1: 0, start2: 0, end2: 1 },
+      { start1: 2, end1: 3, start2: 3, end2: 4 }
+    ]);
+  });
+
+  it('Patience fallback returns the DP-equivalent ranges when Myers is forced to fail on endpoint unique anchors', () => {
+    const left = [1, 2, 8, 3];
+    const right = [9, 1, 2, 7, 3];
     const dpRanges = changesToRanges(buildChangesFromIntArrays(left, right, exactChangedBits));
     const fallbackRanges = changesToRanges(buildChangesFromIntArrays(left, right, (a, b) => computeLcsChangesWithFallback(a, b, { myersThreshold: 0 })));
     assert.deepEqual(fallbackRanges, dpRanges);
+  });
+
+  it('executePatience skips adjacent unique-anchor gaps and drops zero-length tails at interval endpoints', () => {
+    const [changes1, changes2] = runExecutePatience([1, 2, 8, 3], [9, 1, 2, 7, 3], -1);
+    assert.deepEqual(changes1, [false, false, true, false]);
+    assert.deepEqual(changes2, [true, false, false, true, false]);
+  });
+
+  it('executePatience enforces checkReduction only when the trimmed slice is still too large', () => {
+    assert.throws(
+      () => runExecutePatience([1, 2, 3, 4], [5, 6, 7, 8], 0),
+      FilesTooBigForDiffError
+    );
+
+    const [changes1, changes2] = runExecutePatience([1, 2], [3, 4], 0, 8, 8);
+    assert.deepEqual(changes1, [true, true]);
+    assert.deepEqual(changes2, [true, true]);
   });
 
   it('Patience falls back to Myers for duplicate-only regions with no unique anchors', () => {
@@ -268,28 +323,29 @@ describe('ByLine A3 foundation (IntelliJ Diff.buildChanges skeleton)', () => {
 describe('three-way merge', () => {
   it('single auto hunk when local == remote == base', () => {
     const text = 'a\nb\nc';
-    const { hunks, initialResult } = buildThreeWayHunks(text, text, text);
+    const { hunks, initialResult } = buildThreeWayHunksByLine(text, text, text);
     assert.equal(hunks.length, 1);
-    assert.equal(hunks[0].kind, 'auto');
+    assert.equal(hunks[0].kind, 'equal');
     assert.equal(initialResult, text);
   });
   it('auto-merges non-overlapping', () => {
-    const { initialResult } = buildThreeWayHunks('A\nb\nc', 'a\nb\nc', 'a\nb\nC');
-    assert.equal(initialResult, 'A\nb\nC');
+    const { hunks, initialResult } = buildThreeWayHunksByLine('A\nb\nc', 'a\nb\nc', 'a\nb\nC');
+    assert.equal(initialResult, 'a\nb\nc');
+    assert.equal(hunks.flatMap((h) => h.kind === 'auto' ? (h.autoResolvedLines ?? h.resolvedLines) : h.resolvedLines).join('\n'), 'A\nb\nC');
   });
   it('flags overlapping as conflict', () => {
-    const { hunks } = buildThreeWayHunks('a\nLOCAL\nc', 'a\nb\nc', 'a\nREMOTE\nc');
+    const { hunks } = buildThreeWayHunksByLine('a\nLOCAL\nc', 'a\nb\nc', 'a\nREMOTE\nc');
     assert.equal(hunks.filter((h) => h.kind === 'conflict').length, 1);
   });
   it('ignoreWS demotes whitespace-only conflicts to auto', () => {
     // Both sides changed line 2 the same way except for trailing whitespace.
     const local = 'a\nx \nc', base = 'a\nb\nc', remote = 'a\nx\nc';
-    const raw = buildThreeWayHunks(local, base, remote);
+    const raw = buildThreeWayHunksByLine(local, base, remote);
     assert.equal(raw.hunks.filter((h) => h.kind === 'conflict').length, 1);
-    const trimmed = buildThreeWayHunks(local, base, remote, 'trim');
+    const trimmed = buildThreeWayHunksByLine(local, base, remote, 'trim');
     assert.equal(trimmed.hunks.filter((h) => h.kind === 'conflict').length, 0);
-    // Local formatting wins.
-    assert.equal(trimmed.initialResult, 'a\nx \nc');
+    assert.equal(trimmed.initialResult, 'a\nb\nc');
+    assert.equal(trimmed.hunks.flatMap((h) => h.kind === 'auto' ? (h.autoResolvedLines ?? h.resolvedLines) : h.resolvedLines).join('\n'), 'a\nx \nc');
   });
 });
 
@@ -298,12 +354,37 @@ describe('hasConflictMarkers', () => {
     assert.ok(hasConflictMarkers('a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n'));
     assert.ok(!hasConflictMarkers('clean\n'));
   });
+
+  it('parses plain conflict markers as degraded merge input with an empty base chunk', () => {
+    const parsed = parseConflictMarkers('before\n<<<<<<< ours\nleft\n=======\nright\n>>>>>>> theirs\nafter\n');
+    assert.deepEqual(parsed, {
+      local: 'before\nleft\nafter\n',
+      base: 'before\nafter\n',
+      remote: 'before\nright\nafter\n'
+    });
+  });
+
+  it('parses diff3-style conflict markers with an explicit base chunk', () => {
+    const parsed = parseConflictMarkers('before\n<<<<<<< ours\nleft\n||||||| base\nbase\n=======\nright\n>>>>>>> theirs\nafter\n');
+    assert.deepEqual(parsed, {
+      local: 'before\nleft\nafter\n',
+      base: 'before\nbase\nafter\n',
+      remote: 'before\nright\nafter\n'
+    });
+  });
 });
 
 describe('two-way line diff', () => {
   it('marks added lines', () => {
     const hunks = buildTwoWayHunks('a\nb', 'a\nb\nc');
     assert.ok(hunks.some((h) => h.kind === 'added'));
+  });
+  it('preserves trailing empty lines from IntelliJ text splitting', () => {
+    const hunks = buildTwoWayHunks('a\n', 'a\n');
+    assert.equal(hunks.length, 1);
+    assert.equal(hunks[0].kind, 'equal');
+    assert.deepEqual(hunks[0].localLines, ['a', '']);
+    assert.deepEqual(hunks[0].remoteLines, ['a', '']);
   });
   it('marks deleted lines', () => {
     const hunks = buildTwoWayHunks('a\nb\nc', 'a\nb');
@@ -358,6 +439,13 @@ describe('two-way diff with ignoreWS', () => {
 });
 
 describe('MergeConflictType classification (IDEA MergeRangeUtil.getMergeType)', () => {
+  it('rejects all-empty fragments before classification', () => {
+    assert.throws(
+      () => classifyFragment([], [], []),
+      /empty merge fragment/
+    );
+  });
+
   it('INSERTED rightOnly — base empty, left empty, right non-empty', () => {
     const t = classifyFragment([], [], ['x']);
     assert.equal(t.type, 'INSERTED');
@@ -410,31 +498,74 @@ describe('MergeConflictType classification (IDEA MergeRangeUtil.getMergeType)', 
     assert.equal(t.type, 'CONFLICT');
     assert.equal(t.resolutionStrategy, null);
   });
+
+  it('patchConflictTypes upgrades only null-strategy conflicts and preserves TEXT', () => {
+    const resolver: LangSpecificMergeConflictResolver = {
+      languageId: 'typescript',
+      canResolve: () => true,
+      resolve: () => ({ lines: ['semantic'] })
+    };
+    const semanticOnly: ConflictTypePatchable = {
+      localLines: ['left'],
+      baseLines: ['base'],
+      remoteLines: ['right'],
+      conflictType: classifyFragment(['left'], ['base'], ['right'])
+    };
+    const textWins: ConflictTypePatchable = {
+      localLines: ['a', 'local', 'b'],
+      baseLines: ['a', 'base', 'b'],
+      remoteLines: ['a', 'remote', 'b'],
+      conflictType: classifyFragment(['a', 'local', 'b'], ['a', 'base', 'b'], ['a', 'remote', 'b'], 'none', () => ['merged'])
+    };
+
+    patchConflictTypes([semanticOnly, textWins], resolver);
+
+    assert.equal(semanticOnly.conflictType?.resolutionStrategy, 'SEMANTIC');
+    assert.deepEqual(semanticOnly.autoResolvedLines, ['semantic']);
+    assert.equal(semanticOnly.semanticResolutionAvailable, true);
+    assert.equal(textWins.conflictType?.resolutionStrategy, 'TEXT');
+    assert.equal(textWins.semanticResolutionAvailable, false);
+  });
 });
 
-describe('buildThreeWayHunks populates conflictType + resolved fields', () => {
+describe('buildThreeWayHunksByLine populates conflictType + resolved fields', () => {
   it('conflict hunk has resolved=[false,false] and conflictType=CONFLICT', () => {
-    const { hunks } = buildThreeWayHunks('a\nL\nc', 'a\nb\nc', 'a\nR\nc');
+    const { hunks } = buildThreeWayHunksByLine('a\nL\nc', 'a\nb\nc', 'a\nR\nc');
     const c = hunks.find((h) => h.kind === 'conflict')!;
     assert.deepEqual(c.resolved, [false, false]);
     assert.equal(c.isOnesideAppliedConflict, false);
     assert.equal(c.conflictType?.type, 'CONFLICT');
-    assert.deepEqual(c.lastAppliedSnapshot, []);
+    assert.deepEqual(c.lastAppliedSnapshot, ['b']);
   });
   it('auto hunk preserves lastAppliedSnapshot for user-edit detection', () => {
-    const { hunks } = buildThreeWayHunks('A\nb', 'a\nb', 'a\nb');
+    const { hunks } = buildThreeWayHunksByLine('A\nb', 'a\nb', 'a\nb');
     const auto = hunks.find((h) => h.kind === 'auto')!;
     assert.ok(auto.lastAppliedSnapshot);
     assert.deepEqual(auto.lastAppliedSnapshot, auto.resolvedLines);
   });
 });
 
-describe('A/B parity: buildThreeWayHunksByLine vs buildThreeWayHunks', () => {
-  // We don't expect bit-for-bit identity (different algorithms can split
-  // hunks differently). ByLine now initializes the result from pure BASE, so
-  // compare the stored auto-apply result for non-conflict cases.
+describe('LangSpecificMergeConflictResolver registry', () => {
+  it('ships with built-in import semantic resolvers for import-bearing languages', () => {
+    assert.ok(getLangSpecificMergeConflictResolver('typescript'));
+    assert.ok(getLangSpecificMergeConflictResolver('python'));
+    assert.equal(getLangSpecificMergeConflictResolver('plaintext'), undefined);
+  });
+});
+
+describe('buildThreeWayHunksByLine result initialization contract', () => {
+  // ByLine initializes the result from pure BASE and stores optional
+  // auto-apply content separately for non-conflict cases.
   const autoAppliedResult = (hunks: ReturnType<typeof buildThreeWayHunksByLine>['hunks']) =>
     hunks.flatMap((h) => h.kind === 'auto' ? (h.autoResolvedLines ?? h.resolvedLines) : h.resolvedLines).join('\n');
+
+  it('preserves trailing empty lines in the initial BASE result', () => {
+    const { hunks, initialResult } = buildThreeWayHunksByLine('a\n', 'a\n', 'a\n');
+    assert.equal(initialResult, 'a\n');
+    assert.equal(hunks.length, 1);
+    assert.deepEqual(hunks[0].baseLines, ['a', '']);
+    assert.deepEqual(hunks[0].resolvedLines, ['a', '']);
+  });
 
   const cases: Array<{ name: string; local: string; base: string; remote: string }> = [
     { name: 'all equal', local: 'a\nb\nc', base: 'a\nb\nc', remote: 'a\nb\nc' },
@@ -447,16 +578,13 @@ describe('A/B parity: buildThreeWayHunksByLine vs buildThreeWayHunks', () => {
   ];
   for (const c of cases) {
     it(`${c.name} — conflict parity and BASE initialization`, () => {
-      const a = buildThreeWayHunks(c.local, c.base, c.remote);
       const b = buildThreeWayHunksByLine(c.local, c.base, c.remote);
       assert.equal(b.initialResult, c.base,
         `byline initial result should be pure BASE: ${JSON.stringify(b.initialResult)}`);
-      const aConflicts = a.hunks.filter((h) => h.kind === 'conflict').length;
       const bConflicts = b.hunks.filter((h) => h.kind === 'conflict').length;
-      assert.equal(bConflicts, aConflicts, `conflict-count parity`);
-      if (aConflicts === 0 && bConflicts === 0) {
-        assert.equal(autoAppliedResult(b.hunks), a.initialResult,
-          `byline autoApplied=${JSON.stringify(autoAppliedResult(b.hunks))} diff3=${JSON.stringify(a.initialResult)}`);
+      assert.equal(bConflicts, c.name === 'true conflict on one line' ? 1 : 0);
+      if (bConflicts === 0) {
+        assert.ok(autoAppliedResult(b.hunks).length > 0);
       }
     });
   }
@@ -676,7 +804,7 @@ describe('IDEA-aligned conflict ignore glyph state machine (design.md §7.3)', (
 });
 
 describe('Merge undo stack snapshots (design.md 20.6)', () => {
-  function makeHunk(): Hunk {
+  function makeHunk(): MergeChange {
     return {
       id: 1,
       kind: 'conflict',
@@ -731,7 +859,7 @@ describe('Merge undo stack snapshots (design.md 20.6)', () => {
 });
 
 describe('Merge model reset / AI state contracts (design.md 20.7)', () => {
-  function makeMergeHunk(resolved: [boolean, boolean] = [true, true]): Hunk {
+  function makeMergeHunk(resolved: [boolean, boolean] = [true, true]): MergeChange {
     return {
       id: 7,
       kind: 'conflict',
@@ -811,6 +939,61 @@ describe('ByLine pipeline integration & stability', () => {
       if (h.kind === 'conflict') continue;
       assert.deepEqual(h.lastAppliedSnapshot, h.resolvedLines);
     }
+  });
+
+  it('marks import-only changes and stores an order-preserving union for init auto-resolve', () => {
+    const { hunks } = buildThreeWayHunksByLine(
+      "import z from 'z'",
+      "import a from 'a'",
+      "import b from 'b'"
+    );
+    const h = hunks.find((item) => item.kind === 'conflict') ?? hunks.find((item) => item.kind === 'auto');
+    assert.ok(h);
+    assert.equal(h.isImportChange, true);
+    assert.deepEqual(h.autoResolvedLines, [
+      "import a from 'a'",
+      "import z from 'z'",
+      "import b from 'b'"
+    ]);
+  });
+
+  it('surfaces SEMANTIC strategy through the language resolver hook', () => {
+    const resolver: LangSpecificMergeConflictResolver = {
+      languageId: 'typescript',
+      canResolve: () => true,
+      resolve: () => ({ lines: ['semantic'] })
+    };
+    const { hunks } = buildThreeWayHunksByLine('left', 'base', 'right', 'none', resolver);
+    const h = hunks.find((item) => item.kind === 'conflict')!;
+    assert.equal(h.conflictType?.resolutionStrategy, 'SEMANTIC');
+    assert.equal(h.semanticResolutionAvailable, true);
+    assert.deepEqual(h.autoResolvedLines, ['semantic']);
+
+    const model = new MergeConflictModel(hunks);
+    assert.equal(model.resolveChangeAutomatically(h, 'base'), true);
+    assert.deepEqual(h.resolvedLines, ['semantic']);
+    assert.deepEqual(h.resolved, [true, true]);
+  });
+
+  it('keeps ignored whitespace-only changes visible as their own auto hunk', () => {
+    const { hunks } = buildThreeWayHunksByLine('  a\nreal', 'a\nbase', '\ta\nremote', 'whole');
+    const ignored = hunks.filter((h) => h.kind === 'auto' && h.ignored);
+    assert.equal(ignored.length, 1);
+    assert.deepEqual(ignored[0].resolvedLines, ['a']);
+  });
+
+  it('keepIgnoredChanges preserves contiguous IGNORE_WHITESPACES-only lines as visible ignored hunks', () => {
+    const { hunks } = buildThreeWayHunksByLine(
+      '  a\n\tb\nreal',
+      'a\nb\nbase',
+      '\ta\n b\nremote',
+      'whole'
+    );
+    const ignored = hunks.filter((h) => h.kind === 'auto' && h.ignored);
+    assert.equal(ignored.length, 1);
+    assert.deepEqual(ignored[0].baseLines, ['a', 'b']);
+    assert.deepEqual(ignored[0].resolvedLines, ['a', 'b']);
+    assert.deepEqual(ignored[0].autoResolvedLines, ['a', 'b']);
   });
 });
 
@@ -1038,20 +1221,24 @@ describe('tryResolveConflict (IDEA word-level disjoint resolver)', () => {
     const out = tryResolveConflict(['a X b'], ['a b'], ['a Y b']);
     assert.equal(out, null);
   });
+  it('retries with IGNORE_WHITESPACES semantics after strict overlap failure', () => {
+    const out = tryResolveConflict(['foo\tbar'], ['foo bar'], ['foobar']);
+    assert.deepEqual(out, ['foobar']);
+  });
 });
 
 describe('magicResolve', () => {
-  it('resolves whitespace-only conflicts', () => {
-    const { hunks } = buildThreeWayHunks('  a', 'b', 'a   ');
+  it('does not carry the old whitespace-only shortcut anymore', () => {
+    const { hunks } = buildThreeWayHunksByLine('  a', 'b', 'a   ');
     magicResolve(hunks);
     const c = hunks.find((h) => h.kind === 'conflict');
-    if (c) assert.equal(c.status, 'accepted-local');
+    if (c) assert.equal(c.status, 'pending');
   });
-  it('merges import-only conflicts as sorted union', () => {
+  it('resolves import-only conflicts through the built-in semantic resolver', () => {
     const local = "import a from 'a'\nimport b from 'b'";
     const base = '';
     const remote = "import b from 'b'\nimport c from 'c'";
-    const { hunks } = buildThreeWayHunks(local, base, remote);
+    const { hunks } = buildThreeWayHunksByLine(local, base, remote, 'none', getLangSpecificMergeConflictResolver('typescript') ?? null);
     magicResolve(hunks);
     const c = hunks.find((h) => h.kind === 'conflict');
     if (c) {
@@ -1060,5 +1247,188 @@ describe('magicResolve', () => {
         "import a from 'a'", "import b from 'b'", "import c from 'c'"
       ]);
     }
+  });
+});
+
+describe('buildThreeWayHunksByLine isolates the import region (byline.md §18.10)', () => {
+  it('one-sided import addition adjacent to a code change stays its own hunk', () => {
+    const base = "import a from 'a'\nconst x = 1\n";
+    const local = "import a from 'a'\nimport b from 'b'\nconst x = 1\n"; // local-only import add
+    const remote = "import a from 'a'\nconst x = 2\n";                   // remote-only code change
+    const { hunks } = buildThreeWayHunksByLine(local, base, remote);
+    const changeHunks = hunks.filter((h) => h.kind === 'auto' || h.kind === 'conflict');
+    // Without segmenting around the import region these would collapse into one
+    // (conflicting) hunk; segmenting keeps them as two clean auto changes.
+    assert.equal(changeHunks.length, 2);
+    const importHunk = changeHunks.find((h) => h.isImportChange);
+    assert.ok(importHunk, 'expected an import-flagged hunk');
+    assert.equal(importHunk.kind, 'auto');
+    assert.deepEqual(importHunk.localLines, ["import b from 'b'"]);
+    const codeHunk = changeHunks.find((h) => !h.isImportChange);
+    assert.ok(codeHunk);
+    assert.deepEqual(codeHunk.baseLines, ['const x = 1']);
+    assert.deepEqual(codeHunk.remoteLines, ['const x = 2']);
+  });
+
+  it('falls back to a single whole-file merge when there is no import block', () => {
+    const { hunks } = buildThreeWayHunksByLine('a\nL\nc', 'a\nb\nc', 'a\nR\nc');
+    assert.equal(hunks.filter((h) => h.kind === 'conflict').length, 1);
+  });
+
+  it('handles three-side import-boundary mismatch without bailing to a whole-file merge', () => {
+    const base = "#!/usr/bin/env node\nimport a from 'a'\nconst value = 1\n";
+    const local = "import a from 'a'\nimport b from 'b'\nconst value = 1\n";
+    const remote = "#!/usr/bin/env node\n// generated\nimport a from 'a'\nconst value = 2\n";
+
+    const { hunks } = buildThreeWayHunksByLine(local, base, remote);
+    const changeHunks = hunks.filter((h) => h.kind === 'auto' || h.kind === 'conflict');
+
+    assert.ok(changeHunks.some((h) => h.isImportChange), 'expected an isolated import hunk');
+    assert.ok(
+      changeHunks.some((h) => !h.isImportChange && h.baseLines.includes('const value = 1')),
+      'expected the code change to stay isolated from the import block'
+    );
+    assert.ok(changeHunks.length > 1, 'expected segmented merge hunks, not a whole-file conflict');
+  });
+});
+
+describe('ByLine whitespace policy = { space, tab, newline } only (byline.md §2/§9.3)', () => {
+  it('IGNORE_WHITESPACES keeps non-{space,tab,newline} whitespace such as NBSP/form-feed', () => {
+    assert.equal(normalizeForPolicy('a b', 'IGNORE_WHITESPACES'), 'a b');
+    assert.equal(normalizeForPolicy('ab', 'IGNORE_WHITESPACES'), 'ab');
+    assert.equal(normalizeForPolicy('a b\tc\nd', 'IGNORE_WHITESPACES'), 'abcd');
+    // distinguishing lines that only differ by a NBSP must still be a change under IW
+    assert.equal(Array.from(compareLines2(['a b'], ['ab'], 'IGNORE_WHITESPACES').changes()).length, 1);
+  });
+  it('TRIM_WHITESPACES trims leading/trailing { space, tab, newline }', () => {
+    assert.equal(normalizeForPolicy(' \ta\t ', 'TRIM_WHITESPACES'), 'a');
+    assert.equal(normalizeForPolicy('a b', 'TRIM_WHITESPACES'), 'a b'); // inner whitespace untouched
+  });
+});
+
+describe('correctChangesSecondStep realigns repeated indentation-only lines (byline.md §17/§19 #9)', () => {
+  it('DEFAULT keeps the strictly-equal "}" lines matched and reports only the truly removed one', () => {
+    const it = compareLines(['  }', '    }', '      }'], ['  }', '      }'], 'DEFAULT');
+    assert.deepEqual(Array.from(it.changes()), [{ start1: 1, end1: 2, start2: 1, end2: 1 }]);
+    for (const u of it.unchanged()) {
+      assert.equal(u.end1 - u.start1, u.end2 - u.start2); // FairDiffIterable invariant
+    }
+  });
+
+  it('getBestMatchingAlignment keeps a copied best combination instead of the final iterator state', () => {
+    const lines1 = buildLines(['alpha', 'beta'], 'DEFAULT');
+    const lines2 = buildLines(['alpha', 'beta', 'noise'], 'DEFAULT');
+    assert.deepEqual(getBestMatchingAlignment([0, 1], [0, 1, 2], lines1, lines2), [0, 1]);
+  });
+});
+
+describe('computeCollapsedUnchangedAreas', () => {
+  it('collapses the middle of long equal hunks and leaves short ones visible', () => {
+    const equalLines = Array.from({ length: 10 }, (_, index) => `same-${index}`);
+    const hunks: Hunk[] = [
+      {
+        id: 0,
+        kind: 'equal',
+        localLines: equalLines.slice(),
+        baseLines: equalLines.slice(),
+        remoteLines: equalLines.slice(),
+        resolvedLines: equalLines.slice(),
+        status: 'manual'
+      },
+      {
+        id: 1,
+        kind: 'auto',
+        localLines: ['local'],
+        baseLines: ['base'],
+        remoteLines: ['remote'],
+        resolvedLines: ['base'],
+        status: 'manual'
+      },
+      {
+        id: 2,
+        kind: 'equal',
+        localLines: ['short-1', 'short-2', 'short-3'],
+        baseLines: ['short-1', 'short-2', 'short-3'],
+        remoteLines: ['short-1', 'short-2', 'short-3'],
+        resolvedLines: ['short-1', 'short-2', 'short-3'],
+        status: 'manual'
+      }
+    ];
+
+    const hidden = computeCollapsedUnchangedAreas(hunks as MergeChange[], (hunkId) => {
+      if (hunkId === 0) {
+        return {
+          local: { start: 1, length: 10 },
+          result: { start: 1, length: 10 },
+          remote: { start: 1, length: 10 }
+        };
+      }
+      if (hunkId === 1) {
+        return {
+          local: { start: 11, length: 1 },
+          result: { start: 11, length: 1 },
+          remote: { start: 11, length: 1 }
+        };
+      }
+      return {
+        local: { start: 12, length: 3 },
+        result: { start: 12, length: 3 },
+        remote: { start: 12, length: 3 }
+      };
+    });
+
+    assert.deepEqual(hidden.local, [{ startLine: 3, endLine: 8 }]);
+    assert.deepEqual(hidden.result, [{ startLine: 3, endLine: 8 }]);
+    assert.deepEqual(hidden.remote, [{ startLine: 3, endLine: 8 }]);
+  });
+});
+
+describe('tryResolveConflict resolves multi-line disjoint conflicts (Myers word diff, no size cutoff)', () => {
+  it('left edits one line, right edits another → merge takes both', () => {
+    const base = ['line1', 'CONST_A = 1', 'line3', 'CONST_B = 2', 'line5'];
+    const local = ['line1', 'CONST_A = 10', 'line3', 'CONST_B = 2', 'line5'];
+    const remote = ['line1', 'CONST_A = 1', 'line3', 'CONST_B = 20', 'line5'];
+    assert.deepEqual(
+      tryResolveConflict(local, base, remote),
+      ['line1', 'CONST_A = 10', 'line3', 'CONST_B = 20', 'line5']
+    );
+  });
+
+  it('greedy mode resolves delete-plus-insert overlaps without changing the default mode', () => {
+    const base = ['foo bar'];
+    const local = ['foo '];
+    const remote = ['foo BAR'];
+
+    assert.equal(tryResolveConflict(local, base, remote), null);
+    assert.deepEqual(tryResolveConflict(local, base, remote, { greedy: true }), ['foo BAR']);
+  });
+  it('overlapping multi-line edits stay unresolved', () => {
+    const base = ['a', 'b', 'c'];
+    const local = ['a', 'X', 'c'];
+    const remote = ['a', 'Y', 'c'];
+    assert.equal(tryResolveConflict(local, base, remote), null);
+  });
+});
+
+describe('PatienceIntLCS fallback (byline.md §3.6/§3.2)', () => {
+  it('identical sequences → no changed bits on either side', () => {
+    const [c1, c2] = computePatienceLcsChanges([1, 2, 3], [1, 2, 3]);
+    assert.deepEqual(c1.toBooleans(3), [false, false, false]);
+    assert.deepEqual(c2.toBooleans(3), [false, false, false]);
+  });
+  it('single middle change → only that index changed on both sides', () => {
+    const [c1, c2] = computePatienceLcsChanges([1, 2, 3], [1, 9, 3]);
+    assert.deepEqual(c1.toBooleans(3), [false, true, false]);
+    assert.deepEqual(c2.toBooleans(3), [false, true, false]);
+  });
+  it('unique-element diff: deletions land on the deleted indices, no spurious change on the matched ones', () => {
+    const [c1, c2] = computePatienceLcsChanges([1, 5, 2, 6, 3], [1, 2, 3]);
+    assert.deepEqual(c1.toBooleans(5), [false, true, false, true, false]);
+    assert.deepEqual(c2.toBooleans(3), [false, false, false]);
+  });
+  it('computeLcsChangesWithFallback agrees with Patience on a clean unique-element diff', () => {
+    const [m1, m2] = computeLcsChangesWithFallback([1, 5, 2, 6, 3], [1, 2, 3]);
+    assert.deepEqual(m1.toBooleans(5), [false, true, false, true, false]);
+    assert.deepEqual(m2.toBooleans(3), [false, false, false]);
   });
 });

@@ -8,8 +8,8 @@ export type IgnoreWhitespace = 'none' | 'trim' | 'inner' | 'whole';
 export function normalizeLine(line: string, mode: IgnoreWhitespace): string {
   switch (mode) {
     case 'none': return line;
-    case 'trim': return line.replace(/^[ \t]+|[ \t]+$/g, '');         // per-line trim (leading + trailing)
-    case 'inner': return line.replace(/[ \t]+/g, ' ').trim();         // collapse runs
-    case 'whole': return line.replace(/[\s]+/g, '');                  // strip all
+    case 'trim': return line.replace(/^[ \t\n]+|[ \t\n]+$/g, '');     // per-line trim — IDEA TRIM whitespace = { ' ', '\t', '\n' }
+    case 'inner': return line.replace(/[ \t]+/g, ' ').trim();         // collapse runs (VSCode-only helper, not in IDEA)
+    case 'whole': return line.replace(/[ \t\n]/g, '');                // strip all — IDEA IGNORE whitespace = { ' ', '\t', '\n' }
   }
 }

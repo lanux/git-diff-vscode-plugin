@@ -1,8 +1,8 @@
-import type { Hunk, HunkKind, HunkStatus } from '../../types';
+import type { MergeChange, MergeChangeKind, HunkStatus } from '../../types';
 
 interface HunkSnapshot {
   id: number;
-  kind: HunkKind;
+  kind: MergeChangeKind;
   resolvedLines: string[];
   status: HunkStatus;
   resolved?: [boolean, boolean];
@@ -71,7 +71,7 @@ export class MergeUndoStack {
   }
 }
 
-export function createMergeSnapshot(hunks: readonly Hunk[], resultText: string, dirty: boolean): MergeSnapshot {
+export function createMergeSnapshot(hunks: readonly MergeChange[], resultText: string, dirty: boolean): MergeSnapshot {
   return {
     resultText,
     dirty,
@@ -93,7 +93,7 @@ export function createMergeSnapshot(hunks: readonly Hunk[], resultText: string, 
   };
 }
 
-export function applyMergeSnapshot(hunks: Hunk[], snapshot: MergeSnapshot): void {
+export function applyMergeSnapshot(hunks: MergeChange[], snapshot: MergeSnapshot): void {
   const byId = new Map(snapshot.hunks.map((hunk) => [hunk.id, hunk]));
   for (const hunk of hunks) {
     const saved = byId.get(hunk.id);

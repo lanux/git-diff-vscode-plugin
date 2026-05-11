@@ -96,7 +96,7 @@ export function correctChangesSecondStep(
   return fair(builder.finish());
 }
 
-function getBestMatchingAlignment(
+export function getBestMatchingAlignment(
   subLines1: readonly number[],
   subLines2: readonly number[],
   lines1: readonly Line[],
